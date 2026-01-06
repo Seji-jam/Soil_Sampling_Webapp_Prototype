@@ -6,7 +6,7 @@ from shapely.geometry import shape, Point
 from pathlib import Path
 from fastapi.middleware.cors import CORSMiddleware
 
-from soil_sampling_engine import suggest_clhs_samples
+from backend.soil_sampling_engine import suggest_clhs_samples
 
 DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "acre_points_small.csv"
 df_all = pd.read_csv(DATA_PATH)
