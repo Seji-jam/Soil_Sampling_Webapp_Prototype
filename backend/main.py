@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Dict, Any
 import pandas as pd
@@ -10,24 +10,35 @@ from pyproj import Transformer
 
 from backend.soil_sampling_engine import suggest_clhs_samples
 
-DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "acre_points_small.csv"
+# Paths
+ROOT_DIR = Path(__file__).resolve().parent.parent
+DATA_PATH = ROOT_DIR / "data" / "acre_points_small.csv"
+FRONTEND_DIR = ROOT_DIR / "frontend"
+INDEX_HTML = FRONTEND_DIR / "index.html"
+
 df_all = pd.read_csv(DATA_PATH)
 
-# Convert UTM16N -> lon/lat ONCE
+# Convert UTM 16N -> lon/lat ONCE at startup
 to_ll = Transformer.from_crs("EPSG:32616", "EPSG:4326", always_xy=True).transform
-lons_lats = [to_ll(x, y) for x, y in df_all[["x", "y"]].to_numpy()]
-df_all["lon"] = [p[0] for p in lons_lats]
-df_all["lat"] = [p[1] for p in lons_lats]
+lonlat = [to_ll(float(x), float(y)) for x, y in df_all[["x", "y"]].to_numpy()]
+df_all["lon"] = [p[0] for p in lonlat]
+df_all["lat"] = [p[1] for p in lonlat]
 
-# Dataset extent in lon/lat
 MIN_LON, MAX_LON = float(df_all["lon"].min()), float(df_all["lon"].max())
 MIN_LAT, MAX_LAT = float(df_all["lat"].min()), float(df_all["lat"].max())
 
 app = FastAPI()
 
 class SamplingRequest(BaseModel):
-    polygon: Dict[str, Any]  # GeoJSON geometry (Polygon)
+    polygon: Dict[str, Any]  # GeoJSON geometry
     n_samples: int = 30
+
+@app.get("/")
+def home():
+    # Serve the frontend on Render at "/"
+    if not INDEX_HTML.exists():
+        return JSONResponse(status_code=500, content={"error": f"Missing {INDEX_HTML} on server"})
+    return FileResponse(INDEX_HTML)
 
 @app.get("/api/health")
 def health():
@@ -35,16 +46,15 @@ def health():
 
 @app.get("/api/extent")
 def extent():
-    # Leaflet expects: [[southWestLat, southWestLng], [northEastLat, northEastLng]]
+    # Leaflet bounds format: [[southLat, westLon], [northLat, eastLon]]
     return {"bounds": [[MIN_LAT, MIN_LON], [MAX_LAT, MAX_LON]]}
 
 def _make_valid_polygon(g):
-    # Shapely 2 has make_valid in shapely.validation; older versions don't.
+    # Try make_valid if available; otherwise buffer(0)
     try:
         from shapely.validation import make_valid
         return make_valid(g)
     except Exception:
-        # buffer(0) is a common fix for self-intersections
         return g.buffer(0)
 
 @app.post("/api/suggest-samples")
@@ -56,16 +66,15 @@ def suggest_samples(req: SamplingRequest):
         if poly_ll.is_empty:
             return {"type": "FeatureCollection", "features": []}
 
-        # Quick bbox reject: if polygon is totally outside dataset bbox, return empty.
-        minx, miny, maxx, maxy = poly_ll.bounds  # lon/lat bounds
+        # Quick bbox reject (prevents "random hits" if drawing far away)
+        minx, miny, maxx, maxy = poly_ll.bounds  # lon/lat
         if (maxx < MIN_LON) or (minx > MAX_LON) or (maxy < MIN_LAT) or (miny > MAX_LAT):
             return {"type": "FeatureCollection", "features": []}
 
         prepared = prep(poly_ll)
 
-        # Point-in-polygon in lon/lat (THIS prevents false hits anywhere else on the globe)
         mask = [
-            prepared.covers(Point(lon, lat))   # covers includes boundary points
+            prepared.covers(Point(lon, lat))  # includes boundary
             for lon, lat in zip(df_all["lon"], df_all["lat"])
         ]
         df_sub = df_all.loc[mask].copy()
@@ -99,5 +108,4 @@ def suggest_samples(req: SamplingRequest):
         return {"type": "FeatureCollection", "features": features}
 
     except Exception as e:
-        # Always return JSON so the frontend can display a useful error
         return JSONResponse(status_code=500, content={"error": str(e)})
