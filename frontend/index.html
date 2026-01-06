@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Soil Sampling Prototype</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+  <style>
+    html, body { height: 100%; margin: 0; padding: 0; }
+    #map { height: 100%; }
+    .leaflet-container { font: 14px/1.5 "Helvetica Neue", Arial, Helvetica, sans-serif; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<script>
+  // 1) Basic map
+  const map = L.map('map').setView([40.45, -86.99], 12); // adjust center to your site
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+  }).addTo(map);
+
+  // 2) Feature group for drawn items
+  const drawnItems = new L.FeatureGroup();
+  map.addLayer(drawnItems);
+
+  // 3) Draw control (only polygon)
+  const drawControl = new L.Control.Draw({
+    edit: { featureGroup: drawnItems },
+    draw: {
+      polygon: true,
+      polyline: false,
+      rectangle: false,
+      circle: false,
+      marker: false,
+      circlemarker: false
+    }
+  });
+  map.addControl(drawControl);
+
+  let sampleLayer = null;
+
+  map.on(L.Draw.Event.CREATED, function (event) {
+    const layer = event.layer;
+    drawnItems.clearLayers();
+    drawnItems.addLayer(layer);
+
+    const geojson = layer.toGeoJSON().geometry;
+
+    const n_samples = 30; // you can later add a UI control for this
+
+    fetch('http://127.0.0.1:8000/api/suggest-samples', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        polygon: geojson,
+        n_samples: n_samples
+      })
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) {
+        alert(data.error);
+        return;
+      }
+
+      if (sampleLayer) {
+        map.removeLayer(sampleLayer);
+      }
+
+      sampleLayer = L.geoJSON(data, {
+        pointToLayer: function (feature, latlng) {
+          return L.circleMarker(latlng, {
+            radius: 5,
+            weight: 2
+          }).bindPopup(`
+            ID: ${feature.properties.id}<br>
+            NDVI: ${feature.properties.NDVI.toFixed(3)}<br>
+            Clay: ${feature.properties.total_clay.toFixed(1)}
+          `);
+        }
+      }).addTo(map);
+    })
+    .catch(err => {
+      console.error(err);
+      alert('Error fetching samples');
+    });
+  });
+</script>
+</body>
+</html>
