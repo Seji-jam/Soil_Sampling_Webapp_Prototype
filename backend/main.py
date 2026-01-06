@@ -84,3 +84,12 @@ def suggest_samples(req: SamplingRequest):
         })
 
     return {"type": "FeatureCollection", "features": features}
+
+
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+
+FRONTEND_DIR = Path(__file__).resolve().parents[1] / "frontend"
+
+# Put this AFTER defining /api routes, so /api stays working
+app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

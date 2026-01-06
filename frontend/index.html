@@ -53,7 +53,7 @@
 
     const n_samples = 30; // you can later add a UI control for this
 
-    fetch('http://127.0.0.1:8000/api/suggest-samples', {
+    fetch('/api/suggest-samples', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
