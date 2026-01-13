@@ -9,29 +9,51 @@
     html, body { height: 100%; margin: 0; padding: 0; }
     #map { height: 100%; }
 
+    /* Base panel */
     .panel {
-      position: absolute; top: 10px; z-index: 9999;
-      width: 360px;
-      background: white; padding: 12px; border-radius: 10px;
-      box-shadow: 0 2px 12px rgba(0,0,0,0.22);
+      position: absolute;
+      z-index: 9999;
+      background: rgba(255,255,255,0.88);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      padding: 10px;
+      border-radius: 10px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.20);
       font: 13px/1.4 Arial, sans-serif;
       max-height: calc(100% - 20px);
       overflow: auto;
+      border: 1px solid rgba(0,0,0,0.08);
     }
 
-    .left-panel { left: 10px; }
-    .right-panel { right: 10px; }
+    /* Make the left panel smaller/narrower and move it DOWN so draw toolbar stays visible */
+    .left-panel {
+      left: 10px;
+      top: 70px;          /* key: below Leaflet draw toolbar */
+      width: 260px;       /* narrow */
+    }
+
+    /* Right panel */
+    .right-panel {
+      right: 10px;
+      top: 10px;
+      width: 360px;
+    }
 
     .row { margin: 8px 0; }
     label { display:block; font-weight:600; margin-bottom:4px; }
     input, select, button, textarea { width: 100%; padding: 6px; box-sizing: border-box; }
-    textarea { min-height: 70px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    textarea {
+      min-height: 70px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
     button { cursor: pointer; }
     .small { font-size: 12px; color: #444; }
-    .status { margin-top: 8px; padding: 7px; background:#f6f6f6; border-radius: 7px; }
+    .status { margin-top: 8px; padding: 7px; background: rgba(246,246,246,0.9); border-radius: 7px; }
     .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .hidden { display: none; }
 
-    /* Smaller circular vertex handles */
+    /* Smaller circular vertex handles (instead of big squares) */
     .leaflet-div-icon.leaflet-editing-icon {
       width: 10px !important;
       height: 10px !important;
@@ -43,32 +65,36 @@
       box-shadow: 0 1px 4px rgba(0,0,0,0.25);
     }
 
-    /* Right panel hide/show */
-    .hidden { display: none; }
-
+    /* Floating show buttons */
     .floating-btn {
       position: absolute;
-      top: 10px;
-      right: 10px;
       z-index: 10000;
-      background: white;
+      background: rgba(255,255,255,0.92);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
       border-radius: 10px;
       padding: 8px 10px;
-      box-shadow: 0 2px 12px rgba(0,0,0,0.22);
-      font: 13px/1.4 Arial, sans-serif;
-      display: none; /* only visible when right panel hidden */
+      box-shadow: 0 2px 12px rgba(0,0,0,0.20);
+      border: 1px solid rgba(0,0,0,0.08);
+      display: none;
     }
+    #showRightFloat { top: 10px; right: 10px; }
+    #showLeftFloat  { top: 70px; left: 10px; }  /* matches left panel position */
   </style>
 </head>
 <body>
 <div id="map"></div>
 
-<!-- LEFT: Polygon tools -->
-<div class="panel left-panel">
-  <div class="row"><strong>Polygon</strong></div>
+<!-- LEFT: polygon tools (narrow, semi-transparent) -->
+<div class="panel left-panel" id="leftPanel">
+  <div class="row" style="display:flex; justify-content:space-between; align-items:center;">
+    <strong>Polygon</strong>
+    <button id="hideLeftBtn" style="width:auto; padding:6px 10px;">Hide</button>
+  </div>
 
   <div class="row small">
-    Draw a polygon on the map, or paste coordinates.
+    Draw using the <b>polygon tool</b> on the map (top-left).<br>
+    Or paste coordinates below.
   </div>
 
   <div class="row">
@@ -83,22 +109,22 @@
     <label>Paste polygon coordinates</label>
     <div class="small">One point per line. Use <b>lat, lon</b> or <b>lon, lat</b>.</div>
     <textarea id="coordsInput" placeholder="40.4501, -86.9902&#10;40.4510, -86.9880&#10;40.4492, -86.9870"></textarea>
-    <button id="setPolyBtn">Set polygon from coordinates</button>
+    <button id="setPolyBtn">Set polygon</button>
   </div>
 
   <div class="row">
-    <label>Polygon vertex coordinates (read-only)</label>
-    <textarea id="polyCoords" readonly placeholder="Draw a polygon to see its vertices..."></textarea>
+    <label>Polygon vertices (read-only)</label>
+    <textarea id="polyCoords" readonly placeholder="Draw a polygon to see vertices..."></textarea>
   </div>
 
   <div class="status" id="status">Ready</div>
 </div>
 
-<!-- RIGHT: Sampling + outputs -->
+<!-- RIGHT: sampling + outputs -->
 <div class="panel right-panel" id="rightPanel">
   <div class="row" style="display:flex; justify-content:space-between; align-items:center;">
     <strong>Sampling Planner</strong>
-    <button id="hidePanelBtn" style="width:auto; padding:6px 10px;">Hide</button>
+    <button id="hideRightBtn" style="width:auto; padding:6px 10px;">Hide</button>
   </div>
 
   <div class="row">
@@ -156,9 +182,13 @@
   </div>
 </div>
 
-<!-- Floating show button when right panel hidden -->
-<div class="floating-btn" id="showPanelFloat">
-  <button id="showPanelBtn" style="width:auto; padding:6px 10px;">Show panel</button>
+<!-- Floating show buttons -->
+<div class="floating-btn" id="showRightFloat">
+  <button id="showRightBtn" style="width:auto; padding:6px 10px;">Show planner</button>
+</div>
+
+<div class="floating-btn" id="showLeftFloat">
+  <button id="showLeftBtn" style="width:auto; padding:6px 10px;">Show polygon</button>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -178,14 +208,15 @@
   const drawnItems = new L.FeatureGroup();
   map.addLayer(drawnItems);
 
+  // Keep the draw toolbar in the standard top-left
   const drawControl = new L.Control.Draw({
+    position: 'topleft',
     edit: { featureGroup: drawnItems },
     draw: { polygon: true, polyline: false, rectangle: false, circle: false, marker: false, circlemarker: false }
   });
   map.addControl(drawControl);
 
   let sampleLayer = null;
-  let currentLayer = null;
   let currentPolygon = null;
   let lastReco = null;
   let lastSamples = null;
@@ -238,15 +269,11 @@
     try {
       const latlngs = layer.getLatLngs()[0] || [];
       return latlngs.map((p, i) => `${i+1}) ${p.lat.toFixed(6)}, ${p.lng.toFixed(6)}`).join('\n');
-    } catch {
-      return '';
-    }
+    } catch { return ''; }
   }
 
   function setPolygonFromLayer(layer) {
-    currentLayer = layer;
     currentPolygon = layer.toGeoJSON().geometry;
-
     document.getElementById('polyCoords').value = polygonToCoordsText(layer);
 
     lastReco = null;
@@ -267,8 +294,7 @@
       if (!isFinite(a) || !isFinite(b)) continue;
 
       let lat, lon;
-      if (Math.abs(a) > 90) { lon = a; lat = b; }
-      else { lat = a; lon = b; }
+      if (Math.abs(a) > 90) { lon = a; lat = b; } else { lat = a; lon = b; }
       pts.push([lat, lon]);
     }
     if (pts.length < 3) throw new Error("Need at least 3 points.");
@@ -280,7 +306,6 @@
 
   function updateRecoBox(reco) {
     const box = document.getElementById('recoBox');
-
     if (!reco || reco.candidates_count === 0) {
       box.innerHTML = `Candidates: <b>0</b><br>Recommendations: (no candidates inside polygon)<br>`;
       return;
@@ -291,10 +316,10 @@
 
     box.innerHTML =
       `Candidates: <b>${reco.candidates_count}</b><br>` +
-      `Tier meaning (coverage of heterogeneity in covariates):<br>` +
+      `Tier meaning (coverage of covariate heterogeneity):<br>` +
       `Weak ≥ ${(GAIN_THRESH.weak*100).toFixed(0)}%, Medium ≥ ${(GAIN_THRESH.medium*100).toFixed(0)}%, ` +
       `Good ≥ ${(GAIN_THRESH.good*100).toFixed(0)}%, Perfect ≥ ${(GAIN_THRESH.perfect*100).toFixed(0)}%<br><br>` +
-      `Suggested N (and est. cost):<br>` +
+      `Suggested N (est. cost):<br>` +
       `Weak: <b>${w}</b> ($${(w*cost).toFixed(0)})<br>` +
       `Medium: <b>${m}</b> ($${(m*cost).toFixed(0)})<br>` +
       `Good: <b>${g}</b> ($${(g*cost).toFixed(0)})<br>` +
@@ -321,7 +346,7 @@
     if (!currentPolygon) return alert("Draw a polygon or paste coordinates first.");
     const cost = parseFloat(document.getElementById('costPerSample').value || "25");
 
-    setStatus("Analyzing polygon (recommendations)...");
+    setStatus("Analyzing polygon...");
     try {
       const reco = await postJSON('/api/recommend-n', { polygon: currentPolygon, cost_per_sample: cost });
       lastReco = reco;
@@ -375,9 +400,6 @@
 
       if (sampleLayer) map.removeLayer(sampleLayer);
 
-      const nout = (data.features || []).length;
-      setStatus(`Done: ${nout} points`);
-
       sampleLayer = L.geoJSON(data, {
         pointToLayer: (feature, latlng) =>
           L.circleMarker(latlng, { radius: 6, weight: 3 })
@@ -390,6 +412,7 @@
       const pack = featuresToTextAndCSV(data);
       document.getElementById('samplesBox').value = pack.text;
 
+      setStatus(`Done: ${(data.features || []).length} points`);
     } catch (err) {
       console.error(err);
       setStatus("Fetch failed");
@@ -397,21 +420,34 @@
     }
   }
 
-  // Hide/show right panel
+  // Hide/show panels
+  const leftPanel = document.getElementById('leftPanel');
   const rightPanel = document.getElementById('rightPanel');
-  const showFloat = document.getElementById('showPanelFloat');
-  document.getElementById('hidePanelBtn').addEventListener('click', () => {
+  const showRightFloat = document.getElementById('showRightFloat');
+  const showLeftFloat  = document.getElementById('showLeftFloat');
+
+  document.getElementById('hideRightBtn').addEventListener('click', () => {
     rightPanel.classList.add('hidden');
-    showFloat.style.display = 'block';
+    showRightFloat.style.display = 'block';
   });
-  document.getElementById('showPanelBtn').addEventListener('click', () => {
+  document.getElementById('showRightBtn').addEventListener('click', () => {
     rightPanel.classList.remove('hidden');
-    showFloat.style.display = 'none';
+    showRightFloat.style.display = 'none';
   });
 
-  // UI events
+  document.getElementById('hideLeftBtn').addEventListener('click', () => {
+    leftPanel.classList.add('hidden');
+    showLeftFloat.style.display = 'block';
+  });
+  document.getElementById('showLeftBtn').addEventListener('click', () => {
+    leftPanel.classList.remove('hidden');
+    showLeftFloat.style.display = 'none';
+  });
+
+  // UI bindings
   document.getElementById('analyzeBtn').addEventListener('click', analyzePolygon);
   document.getElementById('sampleBtn').addEventListener('click', generateSamples);
+
   document.getElementById('mode').addEventListener('change', updateModeUI);
   updateModeUI();
 
@@ -420,13 +456,10 @@
 
   document.getElementById('setPolyBtn').addEventListener('click', () => {
     try {
-      const text = document.getElementById('coordsInput').value || '';
-      const pts = parseCoordsText(text);
-
+      const pts = parseCoordsText(document.getElementById('coordsInput').value || '');
       const poly = L.polygon(pts, { color: '#3388ff' });
       drawnItems.clearLayers();
       drawnItems.addLayer(poly);
-
       map.fitBounds(poly.getBounds(), { padding: [20,20] });
       setPolygonFromLayer(poly);
     } catch (e) {
@@ -441,7 +474,7 @@
       await navigator.clipboard.writeText(txt);
       setStatus("Copied coordinates to clipboard.");
     } catch {
-      alert("Copy failed (browser permissions). You can still select + copy manually.");
+      alert("Copy failed. You can still select + copy manually.");
     }
   });
 
@@ -471,19 +504,6 @@
       setPolygonFromLayer(layer);
     });
   });
-
-  // track current polygon
-  function setPolygonFromLayer(layer) {
-    currentLayer = layer;
-    currentPolygon = layer.toGeoJSON().geometry;
-    document.getElementById('polyCoords').value = polygonToCoordsText(layer);
-
-    lastReco = null;
-    lastSamples = null;
-    document.getElementById('recoBox').innerHTML = `Candidates: —<br>Recommendations: —<br>`;
-    document.getElementById('samplesBox').value = '';
-    setStatus("Polygon set. Click 'Analyze polygon'.");
-  }
 </script>
 </body>
 </html>
