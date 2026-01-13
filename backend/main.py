@@ -1,24 +1,31 @@
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+import time
+import hashlib
+
 import pandas as pd
 from shapely.geometry import shape, Point
 from shapely.prepared import prep
 from pathlib import Path
 from pyproj import Transformer
+from fastapi.staticfiles import StaticFiles
 
-from backend.soil_sampling_engine import suggest_clhs_samples
+from backend.soil_sampling_engine import (
+    suggest_clhs_samples,
+    recommend_sample_sizes,
+    add_replicates,
+)
 
 # Paths
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_PATH = ROOT_DIR / "data" / "acre_points_small.csv"
 FRONTEND_DIR = ROOT_DIR / "frontend"
-INDEX_HTML = FRONTEND_DIR / "index.html"
 
 df_all = pd.read_csv(DATA_PATH)
 
-# Convert UTM 16N -> lon/lat ONCE at startup
+# Convert UTM 16N -> lon/lat ONCE
 to_ll = Transformer.from_crs("EPSG:32616", "EPSG:4326", always_xy=True).transform
 lonlat = [to_ll(float(x), float(y)) for x, y in df_all[["x", "y"]].to_numpy()]
 df_all["lon"] = [p[0] for p in lonlat]
@@ -29,62 +36,113 @@ MIN_LAT, MAX_LAT = float(df_all["lat"].min()), float(df_all["lat"].max())
 
 app = FastAPI()
 
+
 class SamplingRequest(BaseModel):
     polygon: Dict[str, Any]  # GeoJSON geometry
     n_samples: int = 30
+    # replicate options
+    replicate_fraction: float = 0.0  # e.g., 0.1 = 10%
+    replicate_radius_m: float = 0.0  # meters
 
-@app.get("/")
-def home():
-    # Serve the frontend on Render at "/"
-    if not INDEX_HTML.exists():
-        return JSONResponse(status_code=500, content={"error": f"Missing {INDEX_HTML} on server"})
-    return FileResponse(INDEX_HTML)
+
+class RecommendRequest(BaseModel):
+    polygon: Dict[str, Any]
+    cost_per_sample: float = 25.0
+
 
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
 
+
 @app.get("/api/extent")
 def extent():
-    # Leaflet bounds format: [[southLat, westLon], [northLat, eastLon]]
     return {"bounds": [[MIN_LAT, MIN_LON], [MAX_LAT, MAX_LON]]}
 
+
 def _make_valid_polygon(g):
-    # Try make_valid if available; otherwise buffer(0)
     try:
         from shapely.validation import make_valid
         return make_valid(g)
     except Exception:
         return g.buffer(0)
 
+
+def _polygon_candidates(poly_geojson: Dict[str, Any]) -> pd.DataFrame:
+    poly_ll = shape(poly_geojson)
+    poly_ll = _make_valid_polygon(poly_ll)
+
+    if poly_ll.is_empty:
+        return df_all.iloc[0:0].copy()
+
+    # Quick bbox reject
+    minx, miny, maxx, maxy = poly_ll.bounds
+    if (maxx < MIN_LON) or (minx > MAX_LON) or (maxy < MIN_LAT) or (miny > MAX_LAT):
+        return df_all.iloc[0:0].copy()
+
+    prepared = prep(poly_ll)
+    mask = [
+        prepared.covers(Point(lon, lat))
+        for lon, lat in zip(df_all["lon"], df_all["lat"])
+    ]
+    return df_all.loc[mask].copy()
+
+
+# Simple in-process cache for recommendations (helps Render performance)
+_RECO_CACHE: dict[str, tuple[float, dict]] = {}
+_RECO_TTL_S = 600  # 10 minutes
+
+
+def _cache_key(poly: dict, cost_per_sample: float) -> str:
+    h = hashlib.sha256((str(poly) + f"|{cost_per_sample}").encode("utf-8")).hexdigest()
+    return h
+
+
+@app.post("/api/recommend-n")
+def recommend_n(req: RecommendRequest):
+    try:
+        key = _cache_key(req.polygon, float(req.cost_per_sample))
+        now = time.time()
+
+        if key in _RECO_CACHE:
+            t0, payload = _RECO_CACHE[key]
+            if now - t0 < _RECO_TTL_S:
+                return payload
+
+        df_sub = _polygon_candidates(req.polygon)
+        if df_sub.empty:
+            payload = {
+                "candidates_count": 0,
+                "curve": [],
+                "tiers": {"weak": 0, "medium": 0, "good": 0, "perfect": 0},
+            }
+            _RECO_CACHE[key] = (now, payload)
+            return payload
+
+        payload = recommend_sample_sizes(
+            df_candidates=df_sub,
+            polygon_geojson=req.polygon,
+            cost_per_sample=float(req.cost_per_sample),
+            include_xy_in_clhs=False,
+            scale_mode="rank_normal",
+        )
+        _RECO_CACHE[key] = (now, payload)
+        return payload
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.post("/api/suggest-samples")
 def suggest_samples(req: SamplingRequest):
     try:
-        poly_ll = shape(req.polygon)
-        poly_ll = _make_valid_polygon(poly_ll)
-
-        if poly_ll.is_empty:
-            return {"type": "FeatureCollection", "features": []}
-
-        # Quick bbox reject (prevents "random hits" if drawing far away)
-        minx, miny, maxx, maxy = poly_ll.bounds  # lon/lat
-        if (maxx < MIN_LON) or (minx > MAX_LON) or (maxy < MIN_LAT) or (miny > MAX_LAT):
-            return {"type": "FeatureCollection", "features": []}
-
-        prepared = prep(poly_ll)
-
-        mask = [
-            prepared.covers(Point(lon, lat))  # includes boundary
-            for lon, lat in zip(df_all["lon"], df_all["lat"])
-        ]
-        df_sub = df_all.loc[mask].copy()
-
+        df_sub = _polygon_candidates(req.polygon)
         if df_sub.empty:
             return {"type": "FeatureCollection", "features": []}
 
         n_samples = int(min(max(1, req.n_samples), len(df_sub)))
 
-        df_sel = suggest_clhs_samples(
+        df_primary = suggest_clhs_samples(
             df_sub,
             n_samples=n_samples,
             polygon_geojson=req.polygon,
@@ -92,20 +150,36 @@ def suggest_samples(req: SamplingRequest):
             scale_mode="rank_normal",
         )
 
+        seed = int(hashlib.sha256(str(req.polygon).encode("utf-8")).hexdigest()[:8], 16)
+        _, df_all_sel = add_replicates(
+            df_candidates=df_sub,
+            df_selected=df_primary,
+            replicate_fraction=float(req.replicate_fraction),
+            replicate_radius_m=float(req.replicate_radius_m),
+            seed=seed,
+        )
+
         features = []
-        for _, row in df_sel.iterrows():
+        for _, row in df_all_sel.iterrows():
+            props = {
+                "id": int(row["id"]) if "id" in row and pd.notna(row["id"]) else None,
+                "NDVI": float(row.get("NDVI", 0)),
+                "total_clay": float(row.get("total_clay", 0)),
+                "slope": float(row.get("slope", 0)),
+                "is_replicate": bool(row.get("is_replicate", False)),
+                "replicate_of": row.get("replicate_of", None),
+            }
             features.append({
                 "type": "Feature",
                 "geometry": {"type": "Point", "coordinates": [float(row["lon"]), float(row["lat"])]},
-                "properties": {
-                    "id": int(row["id"]) if "id" in row else None,
-                    "NDVI": float(row.get("NDVI", 0)),
-                    "total_clay": float(row.get("total_clay", 0)),
-                    "slope": float(row.get("slope", 0)),
-                },
+                "properties": props,
             })
 
         return {"type": "FeatureCollection", "features": features}
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# Serve frontend (must be AFTER /api routes)
+app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
