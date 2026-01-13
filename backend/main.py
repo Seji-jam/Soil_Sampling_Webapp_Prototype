@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 import time
 import hashlib
 
@@ -15,10 +15,8 @@ from fastapi.staticfiles import StaticFiles
 from backend.soil_sampling_engine import (
     suggest_clhs_samples,
     recommend_sample_sizes,
-    add_replicates,
 )
 
-# Paths
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_PATH = ROOT_DIR / "data" / "acre_points_small.csv"
 FRONTEND_DIR = ROOT_DIR / "frontend"
@@ -40,9 +38,6 @@ app = FastAPI()
 class SamplingRequest(BaseModel):
     polygon: Dict[str, Any]  # GeoJSON geometry
     n_samples: int = 30
-    # replicate options
-    replicate_fraction: float = 0.0  # e.g., 0.1 = 10%
-    replicate_radius_m: float = 0.0  # meters
 
 
 class RecommendRequest(BaseModel):
@@ -76,26 +71,22 @@ def _polygon_candidates(poly_geojson: Dict[str, Any]) -> pd.DataFrame:
         return df_all.iloc[0:0].copy()
 
     # Quick bbox reject
-    minx, miny, maxx, maxy = poly_ll.bounds
+    minx, miny, maxx, maxy = poly_ll.bounds  # lon/lat
     if (maxx < MIN_LON) or (minx > MAX_LON) or (maxy < MIN_LAT) or (miny > MAX_LAT):
         return df_all.iloc[0:0].copy()
 
     prepared = prep(poly_ll)
-    mask = [
-        prepared.covers(Point(lon, lat))
-        for lon, lat in zip(df_all["lon"], df_all["lat"])
-    ]
+    mask = [prepared.covers(Point(lon, lat)) for lon, lat in zip(df_all["lon"], df_all["lat"])]
     return df_all.loc[mask].copy()
 
 
-# Simple in-process cache for recommendations (helps Render performance)
+# small cache for /api/recommend-n (keeps Render snappy)
 _RECO_CACHE: dict[str, tuple[float, dict]] = {}
-_RECO_TTL_S = 600  # 10 minutes
+_RECO_TTL_S = 600
 
 
 def _cache_key(poly: dict, cost_per_sample: float) -> str:
-    h = hashlib.sha256((str(poly) + f"|{cost_per_sample}").encode("utf-8")).hexdigest()
-    return h
+    return hashlib.sha256((str(poly) + f"|{cost_per_sample}").encode("utf-8")).hexdigest()
 
 
 @app.post("/api/recommend-n")
@@ -142,7 +133,7 @@ def suggest_samples(req: SamplingRequest):
 
         n_samples = int(min(max(1, req.n_samples), len(df_sub)))
 
-        df_primary = suggest_clhs_samples(
+        df_sel = suggest_clhs_samples(
             df_sub,
             n_samples=n_samples,
             polygon_geojson=req.polygon,
@@ -150,28 +141,22 @@ def suggest_samples(req: SamplingRequest):
             scale_mode="rank_normal",
         )
 
-        seed = int(hashlib.sha256(str(req.polygon).encode("utf-8")).hexdigest()[:8], 16)
-        _, df_all_sel = add_replicates(
-            df_candidates=df_sub,
-            df_selected=df_primary,
-            replicate_fraction=float(req.replicate_fraction),
-            replicate_radius_m=float(req.replicate_radius_m),
-            seed=seed,
-        )
-
         features = []
-        for _, row in df_all_sel.iterrows():
+        for _, row in df_sel.iterrows():
             props = {
                 "id": int(row["id"]) if "id" in row and pd.notna(row["id"]) else None,
+                # return both lon/lat and original x/y so user can use either
+                "lon": float(row["lon"]),
+                "lat": float(row["lat"]),
+                "x": float(row["x"]),
+                "y": float(row["y"]),
                 "NDVI": float(row.get("NDVI", 0)),
                 "total_clay": float(row.get("total_clay", 0)),
                 "slope": float(row.get("slope", 0)),
-                "is_replicate": bool(row.get("is_replicate", False)),
-                "replicate_of": row.get("replicate_of", None),
             }
             features.append({
                 "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [float(row["lon"]), float(row["lat"])]},
+                "geometry": {"type": "Point", "coordinates": [props["lon"], props["lat"]]},
                 "properties": props,
             })
 

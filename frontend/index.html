@@ -8,33 +8,66 @@
   <style>
     html, body { height: 100%; margin: 0; padding: 0; }
     #map { height: 100%; }
+
     .panel {
       position: absolute; top: 10px; right: 10px; z-index: 9999;
-      width: 320px;
-      background: white; padding: 12px; border-radius: 8px;
-      box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+      width: 360px;
+      background: white; padding: 12px; border-radius: 10px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.22);
       font: 13px/1.4 Arial, sans-serif;
+      max-height: calc(100% - 20px);
+      overflow: auto;
     }
     .row { margin: 8px 0; }
     label { display:block; font-weight:600; margin-bottom:4px; }
-    input, select, button { width: 100%; padding: 6px; box-sizing: border-box; }
+    input, select, button, textarea { width: 100%; padding: 6px; box-sizing: border-box; }
+    textarea { min-height: 70px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
     button { cursor: pointer; }
     .small { font-size: 12px; color: #444; }
-    .pill { display:inline-block; padding:2px 6px; border-radius: 999px; background:#eee; margin-right:6px; }
-    .status { margin-top: 8px; padding: 6px; background:#f6f6f6; border-radius: 6px; }
+    .status { margin-top: 8px; padding: 7px; background:#f6f6f6; border-radius: 7px; }
     .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+    /* Make Leaflet-draw vertex handles smaller + circular (instead of big squares) */
+    .leaflet-div-icon.leaflet-editing-icon {
+      width: 10px !important;
+      height: 10px !important;
+      margin-left: -5px !important;
+      margin-top: -5px !important;
+      border-radius: 50% !important;
+      background: #ffffff !important;
+      border: 2px solid #3388ff !important;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.25);
+    }
   </style>
 </head>
 <body>
 <div id="map"></div>
 
 <div class="panel">
-  <div class="row"><strong>Soil Sampling Planner</strong></div>
+  <div class="row"><strong>Soil Sampling Planner (CLHS)</strong></div>
 
   <div class="row small">
-    1) Draw a polygon on the map.<br>
-    2) Click <span class="pill">Analyze polygon</span> to get recommended sample sizes.<br>
-    3) Choose mode + click <span class="pill">Generate samples</span>.
+    Draw a polygon OR paste coordinates. Then click <b>Analyze polygon</b> to get sample-size recommendations.
+  </div>
+
+  <div class="row">
+    <label>Polygon input</label>
+    <select id="polyMode">
+      <option value="draw" selected>Draw on map</option>
+      <option value="coords">Paste coordinates</option>
+    </select>
+  </div>
+
+  <div class="row" id="coordsBox" style="display:none;">
+    <label>Paste polygon coordinates</label>
+    <div class="small">One point per line. Use <b>lat, lon</b> or <b>lon, lat</b>. Example:</div>
+    <textarea id="coordsInput" placeholder="40.4501, -86.9902&#10;40.4510, -86.9880&#10;40.4492, -86.9870"></textarea>
+    <button id="setPolyBtn">Set polygon from coordinates</button>
+  </div>
+
+  <div class="row">
+    <label>Polygon vertex coordinates (read-only)</label>
+    <textarea id="polyCoords" readonly placeholder="Draw a polygon to see its vertices..."></textarea>
   </div>
 
   <div class="row">
@@ -72,25 +105,6 @@
     </select>
   </div>
 
-  <div class="row">
-    <label>Replicates (optional)</label>
-    <select id="repToggle">
-      <option value="off" selected>Off</option>
-      <option value="on">On</option>
-    </select>
-  </div>
-
-  <div class="row grid">
-    <div>
-      <label>Replicate % (0–50)</label>
-      <input id="repFrac" type="number" value="10" min="0" max="50" step="1">
-    </div>
-    <div>
-      <label>Radius (m)</label>
-      <input id="repRadius" type="number" value="3" min="0" step="1">
-    </div>
-  </div>
-
   <div class="row grid">
     <button id="analyzeBtn">Analyze polygon</button>
     <button id="sampleBtn">Generate samples</button>
@@ -98,7 +112,16 @@
 
   <div class="row small" id="recoBox">
     Candidates: —<br>
-    Suggested N (weak/med/good/perfect): —<br>
+    Recommendations: —<br>
+  </div>
+
+  <div class="row">
+    <label>Selected sample coordinates</label>
+    <textarea id="samplesBox" readonly placeholder="Generate samples to see coordinates..."></textarea>
+    <div class="grid">
+      <button id="copyBtn">Copy</button>
+      <button id="csvBtn">Download CSV</button>
+    </div>
   </div>
 
   <div class="status" id="status">Ready</div>
@@ -129,8 +152,17 @@
   map.addControl(drawControl);
 
   let sampleLayer = null;
+  let currentLayer = null;
   let currentPolygon = null;
   let lastReco = null;
+  let lastSamples = null;
+
+  const GAIN_THRESH = {
+    weak: 0.60,
+    medium: 0.75,
+    good: 0.88,
+    perfect: 0.95
+  };
 
   async function postJSON(url, payload) {
     const r = await fetch(url, {
@@ -145,19 +177,112 @@
     return await r.json();
   }
 
+  function setDisabled(id, disabled) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = !!disabled;
+  }
+
+  function updateModeUI() {
+    const mode = document.getElementById('mode').value;
+
+    // Cost/sample stays enabled because it affects budget and Analyze cost outputs.
+    setDisabled('costPerSample', false);
+
+    if (mode === 'manual') {
+      setDisabled('manualN', false);
+      setDisabled('budget', true);
+      setDisabled('tier', true);
+    } else if (mode === 'budget') {
+      setDisabled('manualN', true);
+      setDisabled('budget', false);
+      setDisabled('tier', true);
+    } else { // tier
+      setDisabled('manualN', true);
+      setDisabled('budget', true);
+      setDisabled('tier', false);
+    }
+  }
+
+  function updatePolyModeUI() {
+    const pm = document.getElementById('polyMode').value;
+    document.getElementById('coordsBox').style.display = (pm === 'coords') ? 'block' : 'none';
+  }
+
+  function polygonToCoordsText(layer) {
+    try {
+      const latlngs = layer.getLatLngs()[0] || [];
+      return latlngs.map((p, i) => `${i+1}) ${p.lat.toFixed(6)}, ${p.lng.toFixed(6)}`).join('\n');
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function setPolygonFromLayer(layer) {
+    currentLayer = layer;
+    currentPolygon = layer.toGeoJSON().geometry;
+
+    document.getElementById('polyCoords').value = polygonToCoordsText(layer);
+
+    // Reset reco + samples display when polygon changes
+    lastReco = null;
+    lastSamples = null;
+    document.getElementById('recoBox').innerHTML = `Candidates: —<br>Recommendations: —<br>`;
+    document.getElementById('samplesBox').value = '';
+    setStatus("Polygon set. Click 'Analyze polygon'.");
+  }
+
+  function parseCoordsText(text) {
+    const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const pts = [];
+
+    for (const line of lines) {
+      const parts = line.split(/[,\s]+/).filter(Boolean);
+      if (parts.length < 2) continue;
+      const a = parseFloat(parts[0]);
+      const b = parseFloat(parts[1]);
+      if (!isFinite(a) || !isFinite(b)) continue;
+
+      // Heuristic: if |a| > 90, treat as lon,lat; else lat,lon
+      let lat, lon;
+      if (Math.abs(a) > 90) { lon = a; lat = b; }
+      else { lat = a; lon = b; }
+
+      pts.push([lat, lon]);
+    }
+
+    if (pts.length < 3) throw new Error("Need at least 3 points.");
+
+    // Ensure polygon is closed visually (Leaflet will close automatically, but we can help)
+    // (Don't duplicate the last point if it's already equal)
+    const first = pts[0], last = pts[pts.length - 1];
+    const closeEnough = Math.abs(first[0]-last[0]) < 1e-10 && Math.abs(first[1]-last[1]) < 1e-10;
+    if (!closeEnough) pts.push(first);
+
+    return pts;
+  }
+
   function updateRecoBox(reco) {
     const box = document.getElementById('recoBox');
-    if (!reco) {
-      box.innerHTML = `Candidates: —<br>Suggested N (weak/med/good/perfect): —<br>`;
+
+    if (!reco || reco.candidates_count === 0) {
+      box.innerHTML = `Candidates: <b>0</b><br>Recommendations: (no candidates inside polygon)<br>`;
       return;
     }
+
+    const cost = parseFloat(document.getElementById('costPerSample').value || "25");
+
+    const w = reco.tiers.weak, m = reco.tiers.medium, g = reco.tiers.good, p = reco.tiers.perfect;
+
     box.innerHTML =
       `Candidates: <b>${reco.candidates_count}</b><br>` +
-      `Suggested N: ` +
-      `weak=<b>${reco.tiers.weak}</b>, ` +
-      `medium=<b>${reco.tiers.medium}</b>, ` +
-      `good=<b>${reco.tiers.good}</b>, ` +
-      `perfect=<b>${reco.tiers.perfect}</b><br>`;
+      `Tier meaning (coverage of heterogeneity in covariates):<br>` +
+      `Weak ≥ ${(GAIN_THRESH.weak*100).toFixed(0)}%, Medium ≥ ${(GAIN_THRESH.medium*100).toFixed(0)}%, ` +
+      `Good ≥ ${(GAIN_THRESH.good*100).toFixed(0)}%, Perfect ≥ ${(GAIN_THRESH.perfect*100).toFixed(0)}%<br><br>` +
+      `Suggested N (and est. cost):<br>` +
+      `Weak: <b>${w}</b> ($${(w*cost).toFixed(0)})<br>` +
+      `Medium: <b>${m}</b> ($${(m*cost).toFixed(0)})<br>` +
+      `Good: <b>${g}</b> ($${(g*cost).toFixed(0)})<br>` +
+      `Perfect: <b>${p}</b> ($${(p*cost).toFixed(0)})<br>`;
   }
 
   function computeNFromMode() {
@@ -167,7 +292,7 @@
     const budget = parseFloat(document.getElementById('budget').value || "0");
     const tier = document.getElementById('tier').value;
 
-    if (mode === 'manual') return manualN;
+    if (mode === 'manual') return Math.max(1, manualN);
 
     if (mode === 'budget') {
       const n = Math.floor(budget / Math.max(1, cost));
@@ -176,15 +301,14 @@
 
     // tier mode
     if (lastReco && lastReco.tiers && lastReco.tiers[tier] != null) {
-      return parseInt(lastReco.tiers[tier], 10);
+      return Math.max(1, parseInt(lastReco.tiers[tier], 10));
     }
-    // fallback
-    return manualN;
+    return Math.max(1, manualN);
   }
 
   async function analyzePolygon() {
     if (!currentPolygon) {
-      alert("Draw a polygon first.");
+      alert("Draw a polygon or paste coordinates first.");
       return;
     }
     const cost = parseFloat(document.getElementById('costPerSample').value || "25");
@@ -194,7 +318,7 @@
       lastReco = reco;
       updateRecoBox(reco);
 
-      // auto-set manual N to "good" if available
+      // convenience: set manual N to "good"
       if (reco?.tiers?.good) {
         document.getElementById('manualN').value = reco.tiers.good;
         document.getElementById('tier').value = 'good';
@@ -208,27 +332,46 @@
     }
   }
 
+  function featuresToTextAndCSV(fc) {
+    const feats = fc.features || [];
+    const lines = [];
+    const csv = [];
+    csv.push(["idx","id","lat","lon","x_utm","y_utm"].join(","));
+
+    feats.forEach((f, i) => {
+      const p = f.properties || {};
+      const id = (p.id == null ? "" : p.id);
+      const lat = (p.lat == null ? "" : p.lat);
+      const lon = (p.lon == null ? "" : p.lon);
+      const x = (p.x == null ? "" : p.x);
+      const y = (p.y == null ? "" : p.y);
+
+      lines.push(`${i+1}) ${lat}, ${lon}  (id=${id})`);
+      csv.push([i+1, id, lat, lon, x, y].join(","));
+    });
+
+    return { text: lines.join("\n"), csv: csv.join("\n") };
+  }
+
   async function generateSamples() {
     if (!currentPolygon) {
-      alert("Draw a polygon first.");
+      alert("Draw a polygon or paste coordinates first.");
       return;
     }
 
+    const mode = document.getElementById('mode').value;
+    if (mode === 'tier' && !lastReco) {
+      // auto-analyze if user chose tier without analyzing
+      await analyzePolygon();
+      if (!lastReco || lastReco.candidates_count === 0) return;
+    }
+
     const n = computeNFromMode();
-
-    const repOn = document.getElementById('repToggle').value === 'on';
-    const repFrac = repOn ? (parseFloat(document.getElementById('repFrac').value || "0") / 100.0) : 0.0;
-    const repRadius = repOn ? parseFloat(document.getElementById('repRadius').value || "0") : 0.0;
-
     setStatus(`Selecting samples (N=${n})...`);
 
     try {
-      const data = await postJSON('/api/suggest-samples', {
-        polygon: currentPolygon,
-        n_samples: n,
-        replicate_fraction: repFrac,
-        replicate_radius_m: repRadius
-      });
+      const data = await postJSON('/api/suggest-samples', { polygon: currentPolygon, n_samples: n });
+      lastSamples = data;
 
       if (sampleLayer) map.removeLayer(sampleLayer);
 
@@ -237,17 +380,17 @@
 
       sampleLayer = L.geoJSON(data, {
         pointToLayer: (feature, latlng) => {
-          const isRep = !!feature.properties?.is_replicate;
-          const radius = isRep ? 4 : 6;
-          const weight = isRep ? 2 : 3;
-          return L.circleMarker(latlng, { radius, weight })
+          return L.circleMarker(latlng, { radius: 6, weight: 3 })
             .bindPopup(
               `ID: ${feature.properties?.id ?? "NA"}<br>` +
-              `Replicate: ${isRep ? "Yes" : "No"}<br>` +
-              (isRep ? `Replicate of: ${feature.properties?.replicate_of}` : "")
+              `Lat/Lon: ${feature.properties?.lat?.toFixed?.(6) ?? ""}, ${feature.properties?.lon?.toFixed?.(6) ?? ""}<br>` +
+              `UTM: x=${feature.properties?.x ?? ""}, y=${feature.properties?.y ?? ""}`
             );
         }
       }).addTo(map);
+
+      const pack = featuresToTextAndCSV(data);
+      document.getElementById('samplesBox').value = pack.text;
 
     } catch (err) {
       console.error(err);
@@ -259,14 +402,64 @@
   document.getElementById('analyzeBtn').addEventListener('click', analyzePolygon);
   document.getElementById('sampleBtn').addEventListener('click', generateSamples);
 
+  document.getElementById('mode').addEventListener('change', updateModeUI);
+  updateModeUI();
+
+  document.getElementById('polyMode').addEventListener('change', updatePolyModeUI);
+  updatePolyModeUI();
+
+  document.getElementById('setPolyBtn').addEventListener('click', () => {
+    try {
+      const text = document.getElementById('coordsInput').value || '';
+      const pts = parseCoordsText(text);
+
+      const poly = L.polygon(pts, { color: '#3388ff' });
+      drawnItems.clearLayers();
+      drawnItems.addLayer(poly);
+
+      map.fitBounds(poly.getBounds(), { padding: [20,20] });
+      setPolygonFromLayer(poly);
+    } catch (e) {
+      alert("Could not parse polygon coordinates:\n" + e.message);
+    }
+  });
+
+  document.getElementById('copyBtn').addEventListener('click', async () => {
+    const txt = document.getElementById('samplesBox').value || '';
+    if (!txt.trim()) return alert("No sample coordinates yet.");
+    try {
+      await navigator.clipboard.writeText(txt);
+      setStatus("Copied coordinates to clipboard.");
+    } catch {
+      alert("Copy failed (browser permissions). You can still select + copy manually.");
+    }
+  });
+
+  document.getElementById('csvBtn').addEventListener('click', () => {
+    if (!lastSamples) return alert("No samples yet.");
+    const pack = featuresToTextAndCSV(lastSamples);
+    const blob = new Blob([pack.csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "soil_samples.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+
   map.on(L.Draw.Event.CREATED, function (event) {
     drawnItems.clearLayers();
     drawnItems.addLayer(event.layer);
+    setPolygonFromLayer(event.layer);
+  });
 
-    currentPolygon = event.layer.toGeoJSON().geometry;
-    lastReco = null;
-    updateRecoBox(null);
-    setStatus("Polygon set. Click 'Analyze polygon'.");
+  // If user edits polygon, update coordinates + geojson
+  map.on('draw:edited', function (e) {
+    e.layers.eachLayer(function (layer) {
+      setPolygonFromLayer(layer);
+    });
   });
 </script>
 </body>
