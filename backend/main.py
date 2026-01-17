@@ -43,6 +43,7 @@ class SamplingRequest(BaseModel):
 class RecommendRequest(BaseModel):
     polygon: Dict[str, Any]
     cost_per_sample: float = 25.0
+    metric: str = "bd"  # "bd" (Bhattacharyya) or "kld" (sym KL)
 
 
 @app.get("/api/health")
@@ -85,14 +86,16 @@ _RECO_CACHE: dict[str, tuple[float, dict]] = {}
 _RECO_TTL_S = 600
 
 
-def _cache_key(poly: dict, cost_per_sample: float) -> str:
-    return hashlib.sha256((str(poly) + f"|{cost_per_sample}").encode("utf-8")).hexdigest()
+def _cache_key(poly: dict, cost_per_sample: float, metric: str) -> str:
+    metric = (metric or "bd").strip().lower()
+    return hashlib.sha256((str(poly) + f"|{cost_per_sample}|{metric}").encode("utf-8")).hexdigest()
 
 
 @app.post("/api/recommend-n")
 def recommend_n(req: RecommendRequest):
     try:
-        key = _cache_key(req.polygon, float(req.cost_per_sample))
+        metric = (req.metric or "bd").strip().lower()
+        key = _cache_key(req.polygon, float(req.cost_per_sample), metric)
         now = time.time()
 
         if key in _RECO_CACHE:
@@ -116,6 +119,7 @@ def recommend_n(req: RecommendRequest):
             cost_per_sample=float(req.cost_per_sample),
             include_xy_in_clhs=False,
             scale_mode="rank_normal",
+            rep_metric=metric,
         )
         _RECO_CACHE[key] = (now, payload)
         return payload

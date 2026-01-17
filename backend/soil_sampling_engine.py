@@ -49,6 +49,60 @@ def _transform_matrix(X: np.ndarray, mode: str) -> np.ndarray:
     raise ValueError("scale_mode must be one of: none, zscore, rank_uniform, rank_normal")
 
 
+def _fit_transformer(X_full: np.ndarray, mode: str):
+    """Fit a transformation on the *full* set and return a callable.
+
+    Why: for representativeness metrics (BD/KLD) you need both the full
+    candidate set and the sample set in the *same* transformed space.
+    """
+
+    X_full = np.asarray(X_full, dtype=np.float64)
+    if mode == "none":
+        return lambda X: np.asarray(X, dtype=np.float64)
+
+    if mode == "zscore":
+        mu = X_full.mean(axis=0)
+        sd = X_full.std(axis=0, ddof=0)
+        sd[sd == 0] = 1.0
+        return lambda X: (np.asarray(X, dtype=np.float64) - mu) / sd
+
+    if mode in {"rank_uniform", "rank_normal"}:
+        # Empirical CDF fitted on full, applied to sample via searchsorted.
+        # This keeps both sets on a consistent scale.
+        cols_sorted = [np.sort(X_full[:, j]) for j in range(X_full.shape[1])]
+        n = float(len(X_full))
+
+        def _to_u(col_sorted: np.ndarray, x: np.ndarray) -> np.ndarray:
+            idx = np.searchsorted(col_sorted, x, side="left").astype(np.float64)
+            u = (idx + 0.5) / n
+            return np.clip(u, 1e-6, 1.0 - 1e-6)
+
+        if mode == "rank_uniform":
+
+            def _tx(X):
+                X = np.asarray(X, dtype=np.float64)
+                out = np.empty_like(X, dtype=np.float64)
+                for j in range(X.shape[1]):
+                    out[:, j] = _to_u(cols_sorted[j], X[:, j])
+                return out
+
+            return _tx
+
+        # rank_normal
+        from scipy.stats import norm
+
+        def _tx(X):
+            X = np.asarray(X, dtype=np.float64)
+            out = np.empty_like(X, dtype=np.float64)
+            for j in range(X.shape[1]):
+                out[:, j] = norm.ppf(_to_u(cols_sorted[j], X[:, j]))
+            return out
+
+        return _tx
+
+    raise ValueError("scale_mode must be one of: none, zscore, rank_uniform, rank_normal")
+
+
 def _extract_indices_from_clhs(res, n_samples: int) -> np.ndarray:
     if isinstance(res, dict):
         for k in ("sample_indices", "indices", "idx"):
@@ -136,6 +190,70 @@ def suggest_clhs_samples(
 # -------------------------
 # Recommendation logic
 # -------------------------
+def _cov_mle(X: np.ndarray) -> np.ndarray:
+    """Maximum-likelihood covariance (divide by N, not N-1)."""
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError("X must be 2D")
+    n = X.shape[0]
+    if n <= 1:
+        return np.zeros((X.shape[1], X.shape[1]), dtype=np.float64)
+    Xm = X - X.mean(axis=0, keepdims=True)
+    return (Xm.T @ Xm) / float(n)
+
+
+def _regularize_cov(S: np.ndarray, reg_covar: float) -> np.ndarray:
+    S = np.asarray(S, dtype=np.float64)
+    d = S.shape[0]
+    return S + float(reg_covar) * np.eye(d, dtype=np.float64)
+
+
+def _gaussian_kl(m0: np.ndarray, S0: np.ndarray, m1: np.ndarray, S1: np.ndarray) -> float:
+    """KL divergence D_KL(N0 || N1) for Gaussians."""
+    m0 = np.asarray(m0, dtype=np.float64)
+    m1 = np.asarray(m1, dtype=np.float64)
+    S0 = np.asarray(S0, dtype=np.float64)
+    S1 = np.asarray(S1, dtype=np.float64)
+    d = int(m0.size)
+
+    sign0, logdet0 = np.linalg.slogdet(S0)
+    sign1, logdet1 = np.linalg.slogdet(S1)
+    if sign0 <= 0 or sign1 <= 0:
+        # should not happen after regularization, but keep it safe
+        return float("inf")
+
+    # tr(S1^{-1} S0)
+    tr_term = float(np.trace(np.linalg.solve(S1, S0)))
+
+    # (m1 - m0)^T S1^{-1} (m1 - m0)
+    delta = (m1 - m0).reshape(-1, 1)
+    quad = float((delta.T @ np.linalg.solve(S1, delta)).squeeze())
+
+    return float(0.5 * (tr_term + quad - d + (logdet1 - logdet0)))
+
+
+def _gaussian_bhattacharyya(m0: np.ndarray, S0: np.ndarray, m1: np.ndarray, S1: np.ndarray) -> float:
+    """Bhattacharyya distance between Gaussians."""
+    m0 = np.asarray(m0, dtype=np.float64)
+    m1 = np.asarray(m1, dtype=np.float64)
+    S0 = np.asarray(S0, dtype=np.float64)
+    S1 = np.asarray(S1, dtype=np.float64)
+    d = int(m0.size)
+
+    S = 0.5 * (S0 + S1)
+    signS, logdetS = np.linalg.slogdet(S)
+    sign0, logdet0 = np.linalg.slogdet(S0)
+    sign1, logdet1 = np.linalg.slogdet(S1)
+    if signS <= 0 or sign0 <= 0 or sign1 <= 0:
+        return float("inf")
+
+    delta = (m1 - m0).reshape(-1, 1)
+    quad = float((delta.T @ np.linalg.solve(S, delta)).squeeze())
+    term1 = 0.125 * quad
+    term2 = 0.5 * (logdetS - 0.5 * (logdet0 + logdet1))
+    return float(term1 + term2)
+
+
 def _quantile_match_score(full: np.ndarray, sample: np.ndarray, qs: np.ndarray) -> float:
     """
     Compare sample quantiles to full quantiles, normalized by IQR.
@@ -159,20 +277,58 @@ def representativeness_score(
     df_full: pd.DataFrame,
     df_sample: pd.DataFrame,
     covariates: List[str],
+    scale_mode: str = "rank_normal",
+    metric: str = "bd",
+    reg_covar: float = 1e-6,
 ) -> float:
     """
-    Aggregate score across covariates. Lower = sample matches full better.
+    Representativeness score. Lower = sample matches full better.
+
+    metric:
+      - "bd": Bhattacharyya distance between multivariate Gaussians
+      - "kld": symmetrized KL divergence between multivariate Gaussians
+      - "quantile": legacy per-covariate quantile matching
     """
-    qs = np.arange(0.05, 1.0, 0.05)
-    scores = []
-    for c in covariates:
-        if c not in df_full.columns or c not in df_sample.columns:
-            continue
-        a = pd.to_numeric(df_full[c], errors="coerce").to_numpy(float)
-        b = pd.to_numeric(df_sample[c], errors="coerce").to_numpy(float)
-        s = _quantile_match_score(a, b, qs)
-        scores.append(s)
-    return float(np.mean(scores)) if scores else 0.0
+
+    metric = (metric or "bd").strip().lower()
+    covariates = [c for c in covariates if c in df_full.columns and c in df_sample.columns]
+    if not covariates:
+        return 0.0
+
+    # numeric + drop rows with NaNs in any covariate
+    Xf = df_full[covariates].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=True)
+    Xs = df_sample[covariates].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=True)
+    Xf = Xf[np.isfinite(Xf).all(axis=1)]
+    Xs = Xs[np.isfinite(Xs).all(axis=1)]
+
+    if Xf.shape[0] < 5 or Xs.shape[0] < 2:
+        return 0.0
+
+    if metric == "quantile":
+        qs = np.arange(0.05, 1.0, 0.05)
+        scores = []
+        for j, c in enumerate(covariates):
+            s = _quantile_match_score(Xf[:, j], Xs[:, j], qs)
+            scores.append(s)
+        return float(np.mean(scores)) if scores else 0.0
+
+    # Fit transform on full; apply consistently to sample
+    tx = _fit_transformer(Xf, mode=scale_mode)
+    Xf_t = tx(Xf)
+    Xs_t = tx(Xs)
+
+    m0 = Xf_t.mean(axis=0)
+    m1 = Xs_t.mean(axis=0)
+    S0 = _regularize_cov(_cov_mle(Xf_t), reg_covar=reg_covar)
+    S1 = _regularize_cov(_cov_mle(Xs_t), reg_covar=reg_covar)
+
+    if metric in {"bd", "bha", "bhattacharyya"}:
+        return _gaussian_bhattacharyya(m0, S0, m1, S1)
+
+    if metric in {"kld", "kl", "klsym", "symkl"}:
+        return 0.5 * (_gaussian_kl(m0, S0, m1, S1) + _gaussian_kl(m1, S1, m0, S0))
+
+    raise ValueError("metric must be one of: bd, kld, quantile")
 
 
 def _default_n_grid(N: int) -> List[int]:
@@ -195,6 +351,8 @@ def recommend_sample_sizes(
     cost_per_sample: float = 25.0,
     include_xy_in_clhs: bool = False,
     scale_mode: str = "rank_normal",
+    rep_metric: str = "bd",
+    reg_covar: float = 1e-6,
     n_grid: Optional[List[int]] = None,
     base_seed: int = 42,
 ) -> Dict[str, Any]:
@@ -235,7 +393,14 @@ def recommend_sample_sizes(
             scale_mode=scale_mode,
             base_seed=base_seed,
         )
-        sc = representativeness_score(df, df_s, covariates=covariates)
+        sc = representativeness_score(
+            df,
+            df_s,
+            covariates=covariates,
+            scale_mode=scale_mode,
+            metric=rep_metric,
+            reg_covar=reg_covar,
+        )
         scores.append(sc)
         curve.append({"n": int(n), "score": float(sc), "cost": float(n * cost_per_sample)})
 
