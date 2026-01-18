@@ -71,7 +71,6 @@
       box-shadow: 0 2px 12px rgba(0,0,0,0.20);
       border: 1px solid rgba(0,0,0,0.10);
 
-      /* actually transparent */
       background: rgba(255,255,255,0.75);
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
@@ -97,6 +96,12 @@
       margin-bottom:6px;
     }
     .poly-body textarea { min-height: 64px; }
+
+    hr.sep {
+      border: none;
+      border-top: 1px solid #eee;
+      margin: 10px 0;
+    }
   </style>
 </head>
 <body>
@@ -109,7 +114,7 @@
     <button id="hideRightBtn" style="width:auto; padding:6px 10px;">Hide</button>
   </div>
 
-  <!-- Suggestions (shown first; only depends on polygon) -->
+  <!-- Suggestions (polygon-only; shown at top) -->
   <div class="row">
     <label>Polygon suggestions</label>
     <div class="grid" style="grid-template-columns: 1fr 1fr;">
@@ -123,10 +128,14 @@
   </div>
 
   <div class="row small" id="recoBox">
+    Area: —<br>
     Candidates: —<br>
     Recommendations: —<br>
   </div>
 
+  <hr class="sep">
+
+  <!-- Sampling selection mode -->
   <div class="row">
     <label>Mode</label>
     <select id="mode">
@@ -165,6 +174,7 @@
   <div class="row">
     <button id="sampleBtn" disabled>Generate samples</button>
   </div>
+
   <div class="row">
     <label>Selected sample coordinates</label>
     <textarea id="samplesBox" readonly placeholder="Generate samples to see coordinates..."></textarea>
@@ -181,9 +191,26 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<!-- Turf.js for accurate polygon area (geodesic) -->
+<script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
 <script>
   const map = L.map('map').setView([40.45, -86.99], 12);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+  // Basemaps (add Satellite as an optional layer)
+  const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors'
+  });
+  const esriImagery = L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    { maxZoom: 19, attribution: 'Tiles &copy; Esri' }
+  );
+  osm.addTo(map);
+  L.control.layers(
+    { 'OpenStreetMap': osm, 'Satellite (Esri)': esriImagery },
+    {},
+    { position: 'topright' }
+  ).addTo(map);
 
   fetch('/api/extent')
     .then(r => r.ok ? r.json() : null)
@@ -227,7 +254,7 @@
           <div class="row" id="coordsBox" style="display:none;">
             <label>Paste polygon coordinates</label>
             <div class="small">One point per line. lat,lon or lon,lat.</div>
-            <textarea id="coordsInput" placeholder="40.4501, -86.9902&#10;40.4510, -86.9880&#10;40.4492, -86.9870"></textarea>
+            <textarea id="coordsInput" placeholder="40.4501, -86.9902\n40.4510, -86.9880\n40.4492, -86.9870"></textarea>
             <button id="setPolyBtn" type="button">Set polygon</button>
           </div>
 
@@ -252,52 +279,33 @@
   // ===== state =====
   let sampleLayer = null;
   let currentPolygon = null;
+  let currentAreaM2 = null;
   let lastReco = null;
   let lastSamples = null;
 
-  const GAIN_THRESH = { weak: 0.60, medium: 0.75, good: 0.88, perfect: 0.95 };
-
-
-  function setActionEnabled(hasPoly) {
-    const analyzeBtn = document.getElementById('analyzeBtn');
-    const sampleBtn = document.getElementById('sampleBtn');
-    const hint = document.getElementById('analyzeHint');
-    if (analyzeBtn) analyzeBtn.disabled = !hasPoly;
-    if (sampleBtn) sampleBtn.disabled = !hasPoly;
-    if (hint) hint.textContent = hasPoly ? "Polygon set. You can analyze now." : "Draw / set a polygon to enable analysis.";
-  }
-
-  function setAnalyzeLoading(isLoading) {
-    const analyzeBtn = document.getElementById('analyzeBtn');
-    const sampleBtn = document.getElementById('sampleBtn');
-    if (!analyzeBtn) return;
-    if (isLoading) {
-      analyzeBtn.disabled = true;
-      if (sampleBtn) sampleBtn.disabled = true;
-      analyzeBtn.textContent = 'Analyzing...';
-      document.getElementById('recoBox').innerHTML = `Candidates: —<br>Recommendations: <i>Computing...</i><br>`;
-    } else {
-      analyzeBtn.textContent = 'Analyze polygon';
-      setActionEnabled(!!currentPolygon);
-    }
-  }
-
-  function setSampleLoading(isLoading) {
-    const sampleBtn = document.getElementById('sampleBtn');
-    const analyzeBtn = document.getElementById('analyzeBtn');
-    if (!sampleBtn) return;
-    if (isLoading) {
-      sampleBtn.disabled = true;
-      if (analyzeBtn) analyzeBtn.disabled = true;
-      sampleBtn.textContent = 'Generating...';
-    } else {
-      sampleBtn.textContent = 'Generate samples';
-      setActionEnabled(!!currentPolygon);
-    }
-  }
+  // Tier thresholds are interpreted as coverage (0..1) of covariate heterogeneity.
+  const COVERAGE_THRESH = { weak: 0.60, medium: 0.75, good: 0.88, perfect: 0.95 };
 
   const polyStatusEl = () => document.getElementById('polyStatus');
   const setPolyStatus = (m) => { const el = polyStatusEl(); if (el) el.textContent = m; };
+
+  function fmtNum(x) {
+    if (!isFinite(x)) return '—';
+    const ax = Math.abs(x);
+    if (ax >= 1000) return x.toFixed(0);
+    if (ax >= 100) return x.toFixed(1);
+    if (ax >= 10) return x.toFixed(2);
+    return x.toFixed(3);
+  }
+
+  function areaSummaryHtml() {
+    if (!currentAreaM2 || !isFinite(currentAreaM2) || currentAreaM2 <= 0) return `Area: —<br>`;
+    const acres = currentAreaM2 / 4046.8564224;
+    const sqmi = currentAreaM2 / 2589988.110336;
+    const ha = currentAreaM2 / 10000;
+    const sqkm = currentAreaM2 / 1e6;
+    return `Area: <b>${fmtNum(acres)} acres</b> (${fmtNum(ha)} ha) • ${fmtNum(sqmi)} mi² (${fmtNum(sqkm)} km²)<br>`;
+  }
 
   async function postJSON(url, payload) {
     const r = await fetch(url, {
@@ -315,6 +323,17 @@
   function setDisabled(id, disabled) {
     const el = document.getElementById(id);
     if (el) el.disabled = !!disabled;
+  }
+
+  function setActionButtonsEnabled(hasPolygon) {
+    setDisabled('analyzeBtn', !hasPolygon);
+    setDisabled('sampleBtn', !hasPolygon);
+    const hint = document.getElementById('analyzeHint');
+    if (hint) {
+      hint.textContent = hasPolygon
+        ? "Polygon ready. Click 'Analyze polygon' to get suggested N tiers."
+        : "Draw / set a polygon to enable analysis.";
+    }
   }
 
   function updateModeUI() {
@@ -348,17 +367,53 @@
     } catch { return ''; }
   }
 
+  function clearPolygonState() {
+    currentPolygon = null;
+    currentAreaM2 = null;
+    lastReco = null;
+    lastSamples = null;
+
+    if (sampleLayer) {
+      map.removeLayer(sampleLayer);
+      sampleLayer = null;
+    }
+
+    const polyCoords = document.getElementById('polyCoords');
+    if (polyCoords) polyCoords.value = '';
+
+    document.getElementById('recoBox').innerHTML = `Area: —<br>Candidates: —<br>Recommendations: —<br>`;
+    document.getElementById('samplesBox').value = '';
+
+    setActionButtonsEnabled(false);
+    setPolyStatus("No polygon. Draw one or paste coordinates.");
+  }
+
   function setPolygonFromLayer(layer) {
-    currentPolygon = layer.toGeoJSON().geometry;
+    const feat = layer.toGeoJSON();
+    currentPolygon = feat.geometry;
+
+    // area
+    try {
+      if (typeof turf !== 'undefined') {
+        currentAreaM2 = turf.area(feat);
+      } else {
+        currentAreaM2 = null;
+      }
+    } catch {
+      currentAreaM2 = null;
+    }
+
     const polyCoords = document.getElementById('polyCoords');
     if (polyCoords) polyCoords.value = polygonToCoordsText(layer);
 
     lastReco = null;
     lastSamples = null;
-    document.getElementById('recoBox').innerHTML = `Candidates: —<br>Recommendations: —<br>`;
+
+    document.getElementById('recoBox').innerHTML = `${areaSummaryHtml()}Candidates: —<br>Recommendations: —<br>`;
     document.getElementById('samplesBox').value = '';
+
+    setActionButtonsEnabled(true);
     setPolyStatus("Polygon set. Click 'Analyze polygon'.");
-    setActionEnabled(true);
   }
 
   function parseCoordsText(text) {
@@ -384,18 +439,24 @@
 
   function updateRecoBox(reco) {
     const box = document.getElementById('recoBox');
+
     if (!reco || reco.candidates_count === 0) {
-      box.innerHTML = `Candidates: <b>0</b><br>Recommendations: (no candidates inside polygon)<br>`;
+      box.innerHTML =
+        `${areaSummaryHtml()}` +
+        `Candidates: <b>0</b><br>` +
+        `Recommendations: (no candidates inside polygon)<br>`;
       return;
     }
+
     const cost = parseFloat(document.getElementById('costPerSample').value || "25");
     const w = reco.tiers.weak, m = reco.tiers.medium, g = reco.tiers.good, p = reco.tiers.perfect;
 
     box.innerHTML =
+      `${areaSummaryHtml()}` +
       `Candidates: <b>${reco.candidates_count}</b><br>` +
       `Tier meaning (coverage of covariate heterogeneity):<br>` +
-      `Weak ≥ ${(GAIN_THRESH.weak*100).toFixed(0)}%, Medium ≥ ${(GAIN_THRESH.medium*100).toFixed(0)}%, ` +
-      `Good ≥ ${(GAIN_THRESH.good*100).toFixed(0)}%, Perfect ≥ ${(GAIN_THRESH.perfect*100).toFixed(0)}%<br><br>` +
+      `Weak ≥ ${(COVERAGE_THRESH.weak*100).toFixed(0)}%, Medium ≥ ${(COVERAGE_THRESH.medium*100).toFixed(0)}%, ` +
+      `Good ≥ ${(COVERAGE_THRESH.good*100).toFixed(0)}%, Perfect ≥ ${(COVERAGE_THRESH.perfect*100).toFixed(0)}%<br><br>` +
       `Suggested N (est. cost):<br>` +
       `Weak: <b>${w}</b> ($${(w*cost).toFixed(0)})<br>` +
       `Medium: <b>${m}</b> ($${(m*cost).toFixed(0)})<br>` +
@@ -420,25 +481,38 @@
 
   async function analyzePolygon() {
     if (!currentPolygon) return alert("Draw a polygon or paste coordinates first.");
+
     const cost = parseFloat(document.getElementById('costPerSample').value || "25");
+    const metric = (document.getElementById('metric')?.value || 'bd');
+
+    const btn = document.getElementById('analyzeBtn');
+    const prevTxt = btn.textContent;
+
     setPolyStatus("Analyzing polygon...");
-    setAnalyzeLoading(true);
+    btn.textContent = "Analyzing...";
+    setDisabled('analyzeBtn', true);
+    setDisabled('sampleBtn', true);
+
+    document.getElementById('recoBox').innerHTML = `${areaSummaryHtml()}Candidates: —<br>Recommendations: <i>Computing...</i><br>`;
+
     try {
-      const metric = document.getElementById('metric')?.value || 'bd';
       const reco = await postJSON('/api/recommend-n', { polygon: currentPolygon, cost_per_sample: cost, metric });
       lastReco = reco;
       updateRecoBox(reco);
+
       if (reco?.tiers?.good) {
         document.getElementById('manualN').value = reco.tiers.good;
         document.getElementById('tier').value = 'good';
       }
+
       setPolyStatus("Recommendations updated.");
     } catch (err) {
       console.error(err);
       setPolyStatus("Analyze failed");
       alert("Analyze failed:\n" + err.message);
     } finally {
-      setAnalyzeLoading(false);
+      btn.textContent = prevTxt;
+      setActionButtonsEnabled(!!currentPolygon);
     }
   }
 
@@ -470,8 +544,14 @@
     }
 
     const n = computeNFromMode();
+    const btn = document.getElementById('sampleBtn');
+    const prevTxt = btn.textContent;
+
     setPolyStatus(`Selecting samples (N=${n})...`);
-    setSampleLoading(true);
+    btn.textContent = "Loading...";
+    setDisabled('sampleBtn', true);
+    setDisabled('analyzeBtn', true);
+
     try {
       const data = await postJSON('/api/suggest-samples', { polygon: currentPolygon, n_samples: n });
       lastSamples = data;
@@ -495,7 +575,8 @@
       setPolyStatus("Fetch failed");
       alert("Error fetching samples:\n" + err.message);
     } finally {
-      setSampleLoading(false);
+      btn.textContent = prevTxt;
+      setActionButtonsEnabled(!!currentPolygon);
     }
   }
 
@@ -542,11 +623,18 @@
     });
   }
   wirePolygonUI();
-  setActionEnabled(false);
+
+  // initial state
+  clearPolygonState();
 
   // Mode UI wiring
   document.getElementById('mode').addEventListener('change', updateModeUI);
   updateModeUI();
+
+  // If the user changes cost/sample after analyzing, refresh displayed costs.
+  document.getElementById('costPerSample').addEventListener('input', () => {
+    if (lastReco) updateRecoBox(lastReco);
+  });
 
   document.getElementById('analyzeBtn').addEventListener('click', analyzePolygon);
   document.getElementById('sampleBtn').addEventListener('click', generateSamples);
@@ -583,22 +671,14 @@
     setPolygonFromLayer(event.layer);
   });
 
-  map.on('draw:deleted', function () {
-    currentPolygon = null;
-    lastReco = null;
-    lastSamples = null;
-    if (sampleLayer) { map.removeLayer(sampleLayer); sampleLayer = null; }
-    document.getElementById('polyCoords').value = '';
-    document.getElementById('samplesBox').value = '';
-    document.getElementById('recoBox').innerHTML = `Candidates: —<br>Recommendations: —<br>`;
-    setActionEnabled(false);
-    setPolyStatus('Polygon cleared');
-  });
-
   map.on('draw:edited', function (e) {
     e.layers.eachLayer(function (layer) {
       setPolygonFromLayer(layer);
     });
+  });
+
+  map.on('draw:deleted', function () {
+    clearPolygonState();
   });
 </script>
 </body>
