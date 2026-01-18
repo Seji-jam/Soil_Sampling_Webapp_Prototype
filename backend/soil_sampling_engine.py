@@ -337,10 +337,14 @@ def _default_n_grid(N: int) -> List[int]:
     """
     if N <= 12:
         return list(range(1, N + 1))
-    base = [5, 10, 15, 20, 30, 40, 50, 60]
+    # Denser at the low end so tier suggestions don't collapse to the same N
+    # just because the coarse grid skipped over the true threshold-crossing.
+    base = list(range(3, 21)) + [25, 30, 40, 50, 60]
     grid = sorted({n for n in base if n <= N})
-    if grid[-1] != min(60, N):
-        grid.append(min(60, N))
+    # Always include the upper anchor for the curve (helps stabilize gains)
+    top = min(60, N)
+    if top not in grid:
+        grid.append(top)
     return grid
 
 
@@ -380,7 +384,7 @@ def recommend_sample_sizes(
     if not n_grid:
         n_grid = [min(30, N)]
 
-    # compute curve
+    # compute curve (distance-based score: lower is better)
     curve = []
     scores = []
     for n in n_grid:
@@ -410,18 +414,39 @@ def recommend_sample_sizes(
     for i, v in enumerate(sm):
         curve[i]["score"] = float(v)
 
-    # gains (0..1)
-    s0 = float(sm[0])
-    sL = float(sm[-1])
-    denom = (s0 - sL) if abs(s0 - sL) > 1e-12 else 1.0
+    # Convert distance score -> coverage (0..1, higher is better)
+    # For Gaussians, Bhattacharyya coefficient is exp(-BD) which is a true overlap measure.
+    # For sym-KL, we use a bounded heuristic exp(-0.5 * symKL).
+    rep_m = (rep_metric or "bd").strip().lower()
+
+    def _score_to_coverage(s: float) -> float:
+        if not np.isfinite(s):
+            return 0.0
+        if rep_m in {"bd", "bha", "bhattacharyya"}:
+            return float(np.exp(-float(s)))
+        if rep_m in {"kld", "kl", "klsym", "symkl"}:
+            return float(np.exp(-0.5 * float(s)))
+        # fallback
+        return float(np.exp(-float(s)))
+
+    cov = np.asarray([_score_to_coverage(v) for v in sm], dtype=float)
+    # monotone non-decreasing (coverage should increase with n)
+    cov = np.maximum.accumulate(cov)
+    for i, v in enumerate(cov):
+        curve[i]["coverage"] = float(np.clip(v, 0.0, 1.0))
+
+    # gains (0..1) as relative improvement in coverage across the evaluated grid
+    c0 = float(cov[0])
+    cL = float(cov[-1])
+    denom = (cL - c0) if abs(cL - c0) > 1e-12 else 1.0
     for i, _ in enumerate(curve):
-        gain = (s0 - float(sm[i])) / denom
+        gain = (float(cov[i]) - c0) / denom
         curve[i]["gain"] = float(np.clip(gain, 0.0, 1.0))
 
-    # tiers from gain thresholds
+    # tiers from *coverage* thresholds (matches the UI wording)
     def tier_n(thr: float) -> int:
         for row in curve:
-            if row["gain"] >= thr:
+            if float(row.get("coverage", 0.0)) >= thr:
                 return int(row["n"])
         return int(curve[-1]["n"])
 

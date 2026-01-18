@@ -109,7 +109,7 @@
     <button id="hideRightBtn" style="width:auto; padding:6px 10px;">Hide</button>
   </div>
 
-  <!-- Analyze first: independent from N/budget settings (only needs polygon) -->
+  <!-- Suggestions (shown first; only depends on polygon) -->
   <div class="row">
     <label>Polygon suggestions</label>
     <div class="grid" style="grid-template-columns: 1fr 1fr;">
@@ -120,6 +120,11 @@
       <button id="analyzeBtn" disabled>Analyze polygon</button>
     </div>
     <div class="small" id="analyzeHint">Draw / set a polygon to enable analysis.</div>
+  </div>
+
+  <div class="row small" id="recoBox">
+    Candidates: —<br>
+    Recommendations: —<br>
   </div>
 
   <div class="row">
@@ -160,12 +165,6 @@
   <div class="row">
     <button id="sampleBtn" disabled>Generate samples</button>
   </div>
-
-  <div class="row small" id="recoBox">
-    Candidates: —<br>
-    Recommendations: —<br>
-  </div>
-
   <div class="row">
     <label>Selected sample coordinates</label>
     <textarea id="samplesBox" readonly placeholder="Generate samples to see coordinates..."></textarea>
@@ -258,6 +257,45 @@
 
   const GAIN_THRESH = { weak: 0.60, medium: 0.75, good: 0.88, perfect: 0.95 };
 
+
+  function setActionEnabled(hasPoly) {
+    const analyzeBtn = document.getElementById('analyzeBtn');
+    const sampleBtn = document.getElementById('sampleBtn');
+    const hint = document.getElementById('analyzeHint');
+    if (analyzeBtn) analyzeBtn.disabled = !hasPoly;
+    if (sampleBtn) sampleBtn.disabled = !hasPoly;
+    if (hint) hint.textContent = hasPoly ? "Polygon set. You can analyze now." : "Draw / set a polygon to enable analysis.";
+  }
+
+  function setAnalyzeLoading(isLoading) {
+    const analyzeBtn = document.getElementById('analyzeBtn');
+    const sampleBtn = document.getElementById('sampleBtn');
+    if (!analyzeBtn) return;
+    if (isLoading) {
+      analyzeBtn.disabled = true;
+      if (sampleBtn) sampleBtn.disabled = true;
+      analyzeBtn.textContent = 'Analyzing...';
+      document.getElementById('recoBox').innerHTML = `Candidates: —<br>Recommendations: <i>Computing...</i><br>`;
+    } else {
+      analyzeBtn.textContent = 'Analyze polygon';
+      setActionEnabled(!!currentPolygon);
+    }
+  }
+
+  function setSampleLoading(isLoading) {
+    const sampleBtn = document.getElementById('sampleBtn');
+    const analyzeBtn = document.getElementById('analyzeBtn');
+    if (!sampleBtn) return;
+    if (isLoading) {
+      sampleBtn.disabled = true;
+      if (analyzeBtn) analyzeBtn.disabled = true;
+      sampleBtn.textContent = 'Generating...';
+    } else {
+      sampleBtn.textContent = 'Generate samples';
+      setActionEnabled(!!currentPolygon);
+    }
+  }
+
   const polyStatusEl = () => document.getElementById('polyStatus');
   const setPolyStatus = (m) => { const el = polyStatusEl(); if (el) el.textContent = m; };
 
@@ -310,33 +348,6 @@
     } catch { return ''; }
   }
 
-  function setActionButtonsEnabled(hasPolygon) {
-    setDisabled('analyzeBtn', !hasPolygon);
-    setDisabled('sampleBtn', !hasPolygon);
-    const hint = document.getElementById('analyzeHint');
-    if (hint) {
-      hint.textContent = hasPolygon
-        ? "Polygon ready. Click 'Analyze polygon' to get suggested N tiers."
-        : "Draw / set a polygon to enable analysis.";
-    }
-  }
-
-  function clearPolygonState() {
-    currentPolygon = null;
-    lastReco = null;
-    lastSamples = null;
-    if (sampleLayer) {
-      map.removeLayer(sampleLayer);
-      sampleLayer = null;
-    }
-    const polyCoords = document.getElementById('polyCoords');
-    if (polyCoords) polyCoords.value = '';
-    document.getElementById('recoBox').innerHTML = `Candidates: —<br>Recommendations: —<br>`;
-    document.getElementById('samplesBox').value = '';
-    setActionButtonsEnabled(false);
-    setPolyStatus("No polygon. Draw one or paste coordinates.");
-  }
-
   function setPolygonFromLayer(layer) {
     currentPolygon = layer.toGeoJSON().geometry;
     const polyCoords = document.getElementById('polyCoords');
@@ -346,8 +357,8 @@
     lastSamples = null;
     document.getElementById('recoBox').innerHTML = `Candidates: —<br>Recommendations: —<br>`;
     document.getElementById('samplesBox').value = '';
-    setActionButtonsEnabled(true);
     setPolyStatus("Polygon set. Click 'Analyze polygon'.");
+    setActionEnabled(true);
   }
 
   function parseCoordsText(text) {
@@ -410,17 +421,10 @@
   async function analyzePolygon() {
     if (!currentPolygon) return alert("Draw a polygon or paste coordinates first.");
     const cost = parseFloat(document.getElementById('costPerSample').value || "25");
-    const metric = (document.getElementById('metric')?.value || 'bd');
-
-    const btn = document.getElementById('analyzeBtn');
-    const prevTxt = btn.textContent;
-
     setPolyStatus("Analyzing polygon...");
-    btn.textContent = "Analyzing...";
-    setDisabled('analyzeBtn', true);
-    setDisabled('sampleBtn', true);
-    document.getElementById('recoBox').innerHTML = `Candidates: —<br>Recommendations: <i>Computing...</i><br>`;
+    setAnalyzeLoading(true);
     try {
+      const metric = document.getElementById('metric')?.value || 'bd';
       const reco = await postJSON('/api/recommend-n', { polygon: currentPolygon, cost_per_sample: cost, metric });
       lastReco = reco;
       updateRecoBox(reco);
@@ -434,9 +438,7 @@
       setPolyStatus("Analyze failed");
       alert("Analyze failed:\n" + err.message);
     } finally {
-      btn.textContent = prevTxt;
-      // re-enable only if polygon still exists
-      setActionButtonsEnabled(!!currentPolygon);
+      setAnalyzeLoading(false);
     }
   }
 
@@ -468,13 +470,8 @@
     }
 
     const n = computeNFromMode();
-    const btn = document.getElementById('sampleBtn');
-    const prevTxt = btn.textContent;
-
     setPolyStatus(`Selecting samples (N=${n})...`);
-    btn.textContent = "Loading...";
-    setDisabled('sampleBtn', true);
-    setDisabled('analyzeBtn', true);
+    setSampleLoading(true);
     try {
       const data = await postJSON('/api/suggest-samples', { polygon: currentPolygon, n_samples: n });
       lastSamples = data;
@@ -498,8 +495,7 @@
       setPolyStatus("Fetch failed");
       alert("Error fetching samples:\n" + err.message);
     } finally {
-      btn.textContent = prevTxt;
-      setActionButtonsEnabled(!!currentPolygon);
+      setSampleLoading(false);
     }
   }
 
@@ -546,18 +542,11 @@
     });
   }
   wirePolygonUI();
-
-  // initial state
-  clearPolygonState();
+  setActionEnabled(false);
 
   // Mode UI wiring
   document.getElementById('mode').addEventListener('change', updateModeUI);
   updateModeUI();
-
-  // If the user changes cost/sample after analyzing, refresh displayed costs.
-  document.getElementById('costPerSample').addEventListener('input', () => {
-    if (lastReco) updateRecoBox(lastReco);
-  });
 
   document.getElementById('analyzeBtn').addEventListener('click', analyzePolygon);
   document.getElementById('sampleBtn').addEventListener('click', generateSamples);
@@ -594,14 +583,22 @@
     setPolygonFromLayer(event.layer);
   });
 
+  map.on('draw:deleted', function () {
+    currentPolygon = null;
+    lastReco = null;
+    lastSamples = null;
+    if (sampleLayer) { map.removeLayer(sampleLayer); sampleLayer = null; }
+    document.getElementById('polyCoords').value = '';
+    document.getElementById('samplesBox').value = '';
+    document.getElementById('recoBox').innerHTML = `Candidates: —<br>Recommendations: —<br>`;
+    setActionEnabled(false);
+    setPolyStatus('Polygon cleared');
+  });
+
   map.on('draw:edited', function (e) {
     e.layers.eachLayer(function (layer) {
       setPolygonFromLayer(layer);
     });
-  });
-
-  map.on('draw:deleted', function () {
-    clearPolygonState();
   });
 </script>
 </body>
