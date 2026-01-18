@@ -65,13 +65,13 @@
 
     /* ===== Leaflet "merged" polygon control ===== */
     .leaflet-control.polygon-control {
-      width: 260px;
+      width: 270px;
       padding: 10px;
       border-radius: 12px;
       box-shadow: 0 2px 12px rgba(0,0,0,0.20);
       border: 1px solid rgba(0,0,0,0.10);
 
-      background: rgba(255,255,255,0.75);
+      background: rgba(255,255,255,0.78);
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
 
@@ -102,6 +102,12 @@
       border-top: 1px solid #eee;
       margin: 10px 0;
     }
+
+    /* Keep the basemap toggle visible even with the right panel */
+    .leaflet-control-layers {
+      box-shadow: 0 2px 10px rgba(0,0,0,0.18);
+      border-radius: 10px;
+    }
   </style>
 </head>
 <body>
@@ -125,6 +131,10 @@
       <button id="analyzeBtn" disabled>Analyze polygon</button>
     </div>
     <div class="small" id="analyzeHint">Draw / set a polygon to enable analysis.</div>
+    <div class="small" id="aoiHint">Tip: you can also upload an AOI as <b>KML/KMZ</b>, <b>GeoJSON</b>, or a zipped <b>Shapefile</b> in the <b>Polygon</b> control on the map (top-left) → <i>Polygon input</i> → <i>Upload file</i>.</div>
+    <div class="small" style="margin-top:6px;">
+      Tip: you can also upload AOI files (KML/KMZ/GeoJSON/ZIP Shapefile) using the <b>Polygon</b> box on the map (top-left).
+    </div>
   </div>
 
   <div class="row small" id="recoBox">
@@ -178,9 +188,19 @@
   <div class="row">
     <label>Selected sample coordinates</label>
     <textarea id="samplesBox" readonly placeholder="Generate samples to see coordinates..."></textarea>
-    <div class="grid">
+    <div class="grid" style="grid-template-columns: 1fr 1fr 1fr;">
       <button id="copyBtn">Copy</button>
-      <button id="csvBtn">Download CSV</button>
+      <select id="downloadFormat" title="Download format">
+        <option value="csv" selected>CSV</option>
+        <option value="geojson">GeoJSON</option>
+        <option value="kml">KML</option>
+        <option value="kmz">KMZ</option>
+        <option value="shp">Shapefile (ZIP)</option>
+      </select>
+      <button id="downloadBtn">Download</button>
+    </div>
+    <div class="small" style="margin-top:6px;">
+      GeoJSON works well for QGIS/ArcGIS and web tools. KML/KMZ is convenient for Google Earth. Shapefile ZIP is common in older GIS workflows.
     </div>
   </div>
 </div>
@@ -193,10 +213,20 @@
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
 <!-- Turf.js for accurate polygon area (geodesic) -->
 <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+<!-- JSZip for KMZ handling (read/write) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<!-- Shapefile (ZIP) -> GeoJSON -->
+<script src="https://unpkg.com/shpjs@6.2.0/dist/shp.min.js"></script>
+<!-- KML -> GeoJSON -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/togeojson/0.16.0/togeojson.min.js"></script>
+<!-- GeoJSON -> KML -->
+<script src="https://unpkg.com/tokml@0.4.0/tokml.js"></script>
+<!-- GeoJSON -> Shapefile (ZIP) -->
+<script src="https://cdn.jsdelivr.net/npm/shp-write@0.3.2/shpwrite.js"></script>
 <script>
   const map = L.map('map').setView([40.45, -86.99], 12);
 
-  // Basemaps (add Satellite as an optional layer)
+  // Basemaps
   const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap contributors'
@@ -206,15 +236,17 @@
     { maxZoom: 19, attribution: 'Tiles &copy; Esri' }
   );
   osm.addTo(map);
+
+  // Put basemap toggle at bottom-left so it does not hide behind the right panel.
   L.control.layers(
     { 'OpenStreetMap': osm, 'Satellite (Esri)': esriImagery },
     {},
-    { position: 'topright' }
+    { position: 'bottomleft', collapsed: false }
   ).addTo(map);
 
   fetch('/api/extent')
     .then(r => r.ok ? r.json() : null)
-    .then(d => { if (d?.bounds) map.fitBounds(d.bounds, { padding: [20,20] }); })
+    .then(d => { if (d && d.bounds) map.fitBounds(d.bounds, { padding: [20,20] }); })
     .catch(() => {});
 
   const drawnItems = new L.FeatureGroup();
@@ -227,7 +259,7 @@
   });
   map.addControl(drawControl);
 
-  // ===== merged polygon control (sits under draw toolbar automatically) =====
+  // ===== merged polygon control (sits near draw toolbar) =====
   const PolygonControl = L.Control.extend({
     options: { position: 'topleft' },
     onAdd: function() {
@@ -240,7 +272,7 @@
 
         <div class="poly-body" id="polyBody">
           <div class="poly-mini">
-            Use the polygon button above, or paste coordinates.
+            Draw a polygon, paste coordinates, or upload an AOI file.
           </div>
 
           <div class="row">
@@ -248,7 +280,15 @@
             <select id="polyMode">
               <option value="draw" selected>Draw on map</option>
               <option value="coords">Paste coordinates</option>
+              <option value="file">Upload file (KML/KMZ/GeoJSON/ZIP Shapefile)</option>
             </select>
+          </div>
+
+          <div class="row" id="fileBox" style="display:none;">
+            <label>Upload AOI file</label>
+            <div class="small">Accepted: .geojson/.json, .kml, .kmz, or zipped shapefile (.zip containing .shp/.shx/.dbf).</div>
+            <input id="polyFileInput" type="file" accept=".geojson,.json,.kml,.kmz,.zip" />
+            <div class="small" id="polyFileStatus" style="margin-top:6px;">No file selected.</div>
           </div>
 
           <div class="row" id="coordsBox" style="display:none;">
@@ -283,7 +323,7 @@
   let lastReco = null;
   let lastSamples = null;
 
-  // Tier thresholds are interpreted as coverage (0..1) of covariate heterogeneity.
+  // Tier thresholds interpreted as coverage (0..1) of covariate heterogeneity.
   const COVERAGE_THRESH = { weak: 0.60, medium: 0.75, good: 0.88, perfect: 0.95 };
 
   const polyStatusEl = () => document.getElementById('polyStatus');
@@ -358,13 +398,21 @@
   function updatePolyModeUI() {
     const pm = document.getElementById('polyMode').value;
     document.getElementById('coordsBox').style.display = (pm === 'coords') ? 'block' : 'none';
+    document.getElementById('fileBox').style.display = (pm === 'file') ? 'block' : 'none';
+  }
+
+  function setPolyFileStatus(msg) {
+    const el = document.getElementById('polyFileStatus');
+    if (el) el.textContent = msg;
   }
 
   function polygonToCoordsText(layer) {
     try {
       const latlngs = layer.getLatLngs()[0] || [];
       return latlngs.map((p, i) => `${i+1}) ${p.lat.toFixed(6)}, ${p.lng.toFixed(6)}`).join('\n');
-    } catch { return ''; }
+    } catch {
+      return '';
+    }
   }
 
   function clearPolygonState() {
@@ -385,7 +433,7 @@
     document.getElementById('samplesBox').value = '';
 
     setActionButtonsEnabled(false);
-    setPolyStatus("No polygon. Draw one or paste coordinates.");
+    setPolyStatus("No polygon. Draw one, paste coordinates, or upload a file.");
   }
 
   function setPolygonFromLayer(layer) {
@@ -394,11 +442,7 @@
 
     // area
     try {
-      if (typeof turf !== 'undefined') {
-        currentAreaM2 = turf.area(feat);
-      } else {
-        currentAreaM2 = null;
-      }
+      currentAreaM2 = (typeof turf !== 'undefined') ? turf.area(feat) : null;
     } catch {
       currentAreaM2 = null;
     }
@@ -416,8 +460,52 @@
     setPolyStatus("Polygon set. Click 'Analyze polygon'.");
   }
 
+  function normalizeToFeatureCollection(gj) {
+    if (!gj) return null;
+    if (gj.type === 'FeatureCollection') return gj;
+    if (gj.type === 'Feature') return { type: 'FeatureCollection', features: [gj] };
+    if (gj.type && gj.coordinates) {
+      return { type: 'FeatureCollection', features: [{ type: 'Feature', properties: {}, geometry: gj }] };
+    }
+    return null;
+  }
+
+  function pickBestPolygonFeature(fc) {
+    const feats = (fc && fc.features ? fc.features : []).filter(f => f && f.geometry && (f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon'));
+    if (!feats.length) throw new Error('No Polygon/MultiPolygon found in file.');
+
+    // choose largest by area
+    let best = feats[0];
+    let bestA = -Infinity;
+    for (const f of feats) {
+      try {
+        const a = (typeof turf !== 'undefined') ? turf.area(f) : 0;
+        if (a > bestA) { bestA = a; best = f; }
+      } catch {}
+    }
+    return best;
+  }
+
+  function setPolygonFromGeoJSON(gj) {
+    const fc = normalizeToFeatureCollection(gj);
+    if (!fc) throw new Error('Could not parse file as GeoJSON.');
+
+    const polyFeat = pickBestPolygonFeature(fc);
+
+    // Create a Leaflet layer from the feature.
+    const geo = L.geoJSON(polyFeat, { style: { color: '#3388ff' } });
+    let chosenLayer = null;
+    geo.eachLayer(l => { if (!chosenLayer) chosenLayer = l; });
+    if (!chosenLayer) throw new Error('Could not create a polygon layer from the file.');
+
+    drawnItems.clearLayers();
+    drawnItems.addLayer(chosenLayer);
+    map.fitBounds(chosenLayer.getBounds(), { padding: [20,20] });
+    setPolygonFromLayer(chosenLayer);
+  }
+
   function parseCoordsText(text) {
-    const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const lines = (text || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
     const pts = [];
     for (const line of lines) {
       const parts = line.split(/[,\s]+/).filter(Boolean);
@@ -430,11 +518,71 @@
       if (Math.abs(a) > 90) { lon = a; lat = b; } else { lat = a; lon = b; }
       pts.push([lat, lon]);
     }
-    if (pts.length < 3) throw new Error("Need at least 3 points.");
+    if (pts.length < 3) throw new Error('Need at least 3 points.');
+
+    // Close ring
     const first = pts[0], last = pts[pts.length - 1];
     const closeEnough = Math.abs(first[0]-last[0]) < 1e-10 && Math.abs(first[1]-last[1]) < 1e-10;
     if (!closeEnough) pts.push(first);
     return pts;
+  }
+
+  async function handlePolygonFile(file) {
+    if (!file) return;
+    const name = (file.name || '').toLowerCase();
+    setPolyFileStatus(`Loading: ${file.name} ...`);
+    setPolyStatus('Loading AOI file...');
+
+    try {
+      // GeoJSON / JSON
+      if (name.endsWith('.geojson') || name.endsWith('.json')) {
+        const txt = await file.text();
+        const gj = JSON.parse(txt);
+        setPolygonFromGeoJSON(gj);
+        setPolyFileStatus(`Loaded: ${file.name}`);
+        return;
+      }
+
+      // KML
+      if (name.endsWith('.kml')) {
+        const txt = await file.text();
+        const dom = new DOMParser().parseFromString(txt, 'text/xml');
+        const gj = toGeoJSON.kml(dom);
+        setPolygonFromGeoJSON(gj);
+        setPolyFileStatus(`Loaded: ${file.name}`);
+        return;
+      }
+
+      // KMZ
+      if (name.endsWith('.kmz')) {
+        const buf = await file.arrayBuffer();
+        const zip = await JSZip.loadAsync(buf);
+        const kmlName = Object.keys(zip.files).find(k => k.toLowerCase().endsWith('.kml'));
+        if (!kmlName) throw new Error('KMZ does not contain a .kml file.');
+        const kmlTxt = await zip.files[kmlName].async('string');
+        const dom = new DOMParser().parseFromString(kmlTxt, 'text/xml');
+        const gj = toGeoJSON.kml(dom);
+        setPolygonFromGeoJSON(gj);
+        setPolyFileStatus(`Loaded: ${file.name}`);
+        return;
+      }
+
+      // Zipped shapefile
+      if (name.endsWith('.zip')) {
+        const buf = await file.arrayBuffer();
+        const gj = await shp(buf); // shpjs
+        setPolygonFromGeoJSON(gj);
+        setPolyFileStatus(`Loaded: ${file.name}`);
+        return;
+      }
+
+      throw new Error('Unsupported file. Use .geojson/.json, .kml, .kmz, or .zip shapefile.');
+    } catch (e) {
+      console.error(e);
+      setPolyFileStatus(`Failed: ${e.message}`);
+      setPolyStatus('AOI load failed');
+      alert('Could not load polygon file:\n' + e.message);
+    }
   }
 
   function updateRecoBox(reco) {
@@ -448,7 +596,7 @@
       return;
     }
 
-    const cost = parseFloat(document.getElementById('costPerSample').value || "25");
+    const cost = parseFloat(document.getElementById('costPerSample').value || '25');
     const w = reco.tiers.weak, m = reco.tiers.medium, g = reco.tiers.good, p = reco.tiers.perfect;
 
     box.innerHTML =
@@ -466,9 +614,9 @@
 
   function computeNFromMode() {
     const mode = document.getElementById('mode').value;
-    const cost = parseFloat(document.getElementById('costPerSample').value || "25");
-    const manualN = parseInt(document.getElementById('manualN').value || "1", 10);
-    const budget = parseFloat(document.getElementById('budget').value || "0");
+    const cost = parseFloat(document.getElementById('costPerSample').value || '25');
+    const manualN = parseInt(document.getElementById('manualN').value || '1', 10);
+    const budget = parseFloat(document.getElementById('budget').value || '0');
     const tier = document.getElementById('tier').value;
 
     if (mode === 'manual') return Math.max(1, manualN);
@@ -480,16 +628,16 @@
   }
 
   async function analyzePolygon() {
-    if (!currentPolygon) return alert("Draw a polygon or paste coordinates first.");
+    if (!currentPolygon) return alert('Draw a polygon, paste coordinates, or upload a file first.');
 
-    const cost = parseFloat(document.getElementById('costPerSample').value || "25");
-    const metric = (document.getElementById('metric')?.value || 'bd');
+    const cost = parseFloat(document.getElementById('costPerSample').value || '25');
+    const metric = (document.getElementById('metric') && document.getElementById('metric').value) ? document.getElementById('metric').value : 'bd';
 
     const btn = document.getElementById('analyzeBtn');
     const prevTxt = btn.textContent;
 
-    setPolyStatus("Analyzing polygon...");
-    btn.textContent = "Analyzing...";
+    setPolyStatus('Analyzing polygon...');
+    btn.textContent = 'Analyzing...';
     setDisabled('analyzeBtn', true);
     setDisabled('sampleBtn', true);
 
@@ -500,16 +648,16 @@
       lastReco = reco;
       updateRecoBox(reco);
 
-      if (reco?.tiers?.good) {
+      if (reco && reco.tiers && reco.tiers.good) {
         document.getElementById('manualN').value = reco.tiers.good;
         document.getElementById('tier').value = 'good';
       }
 
-      setPolyStatus("Recommendations updated.");
+      setPolyStatus('Recommendations updated.');
     } catch (err) {
       console.error(err);
-      setPolyStatus("Analyze failed");
-      alert("Analyze failed:\n" + err.message);
+      setPolyStatus('Analyze failed');
+      alert('Analyze failed:\n' + err.message);
     } finally {
       btn.textContent = prevTxt;
       setActionButtonsEnabled(!!currentPolygon);
@@ -517,25 +665,25 @@
   }
 
   function featuresToTextAndCSV(fc) {
-    const feats = fc.features || [];
+    const feats = fc && fc.features ? fc.features : [];
     const lines = [];
     const csv = [];
-    csv.push(["idx","id","lat","lon","x_utm","y_utm"].join(","));
+    csv.push(['idx','id','lat','lon','x_utm','y_utm'].join(','));
     feats.forEach((f, i) => {
       const p = f.properties || {};
-      const id = (p.id == null ? "" : p.id);
-      const lat = (p.lat == null ? "" : p.lat);
-      const lon = (p.lon == null ? "" : p.lon);
-      const x = (p.x == null ? "" : p.x);
-      const y = (p.y == null ? "" : p.y);
+      const id = (p.id == null ? '' : p.id);
+      const lat = (p.lat == null ? '' : p.lat);
+      const lon = (p.lon == null ? '' : p.lon);
+      const x = (p.x == null ? '' : p.x);
+      const y = (p.y == null ? '' : p.y);
       lines.push(`${i+1}) ${lat}, ${lon}  (id=${id})`);
-      csv.push([i+1, id, lat, lon, x, y].join(","));
+      csv.push([i+1, id, lat, lon, x, y].join(','));
     });
-    return { text: lines.join("\n"), csv: csv.join("\n") };
+    return { text: lines.join('\n'), csv: csv.join('\n') };
   }
 
   async function generateSamples() {
-    if (!currentPolygon) return alert("Draw a polygon or paste coordinates first.");
+    if (!currentPolygon) return alert('Draw a polygon, paste coordinates, or upload a file first.');
 
     const mode = document.getElementById('mode').value;
     if (mode === 'tier' && !lastReco) {
@@ -548,7 +696,7 @@
     const prevTxt = btn.textContent;
 
     setPolyStatus(`Selecting samples (N=${n})...`);
-    btn.textContent = "Loading...";
+    btn.textContent = 'Loading...';
     setDisabled('sampleBtn', true);
     setDisabled('analyzeBtn', true);
 
@@ -561,8 +709,9 @@
         pointToLayer: (feature, latlng) =>
           L.circleMarker(latlng, { radius: 6, weight: 3 })
             .bindPopup(
-              `ID: ${feature.properties?.id ?? "NA"}<br>` +
-              `Lat/Lon: ${feature.properties?.lat?.toFixed?.(6) ?? ""}, ${feature.properties?.lon?.toFixed?.(6) ?? ""}`
+              `ID: ${feature.properties && feature.properties.id != null ? feature.properties.id : 'NA'}<br>` +
+              `Lat/Lon: ${feature.properties && typeof feature.properties.lat === 'number' ? feature.properties.lat.toFixed(6) : ''}, ` +
+              `${feature.properties && typeof feature.properties.lon === 'number' ? feature.properties.lon.toFixed(6) : ''}`
             )
       }).addTo(map);
 
@@ -572,15 +721,101 @@
       setPolyStatus(`Done: ${(data.features || []).length} points`);
     } catch (err) {
       console.error(err);
-      setPolyStatus("Fetch failed");
-      alert("Error fetching samples:\n" + err.message);
+      setPolyStatus('Fetch failed');
+      alert('Error fetching samples:\n' + err.message);
     } finally {
       btn.textContent = prevTxt;
       setActionButtonsEnabled(!!currentPolygon);
     }
   }
 
-  // Right panel hide/show
+  // ===== downloads =====
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function buildAOIFeature() {
+    if (!currentPolygon) return null;
+    return { type: 'Feature', properties: { role: 'aoi' }, geometry: currentPolygon };
+  }
+
+  function buildDownloadFeatureCollection(includeAOI) {
+    if (!lastSamples) return null;
+    const feats = [];
+    if (includeAOI) {
+      const aoi = buildAOIFeature();
+      if (aoi) feats.push(aoi);
+    }
+    // include sample points
+    for (const f of (lastSamples.features || [])) feats.push(f);
+    return { type: 'FeatureCollection', features: feats };
+  }
+
+  function pointsOnlyFC() {
+    if (!lastSamples) return null;
+    // shapefile export prefers homogeneous geometry
+    return { type: 'FeatureCollection', features: (lastSamples.features || []) };
+  }
+
+  async function downloadSamples() {
+    if (!lastSamples) return alert('No samples yet. Generate samples first.');
+
+    const fmt = document.getElementById('downloadFormat').value;
+
+    try {
+      if (fmt === 'csv') {
+        const pack = featuresToTextAndCSV(lastSamples);
+        downloadBlob(new Blob([pack.csv], { type: 'text/csv;charset=utf-8;' }), 'soil_samples.csv');
+        return;
+      }
+
+      if (fmt === 'geojson') {
+        const fc = buildDownloadFeatureCollection(true);
+        const txt = JSON.stringify(fc, null, 2);
+        downloadBlob(new Blob([txt], { type: 'application/geo+json' }), 'soil_samples.geojson');
+        return;
+      }
+
+      if (fmt === 'kml' || fmt === 'kmz') {
+        const fc = buildDownloadFeatureCollection(true);
+        const kml = tokml(fc, { name: 'id', description: 'role' });
+        if (fmt === 'kml') {
+          downloadBlob(new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' }), 'soil_samples.kml');
+        } else {
+          const zip = new JSZip();
+          zip.file('doc.kml', kml);
+          const kmzBlob = await zip.generateAsync({ type: 'blob' });
+          downloadBlob(kmzBlob, 'soil_samples.kmz');
+        }
+        return;
+      }
+
+      if (fmt === 'shp') {
+        const fcPts = pointsOnlyFC();
+        // shpwrite.zip returns a Blob
+        const blob = shpwrite.zip(fcPts, {
+          folder: 'soil_samples',
+          types: { point: 'soil_samples_points' }
+        });
+        downloadBlob(blob, 'soil_samples_shapefile.zip');
+        return;
+      }
+
+      alert('Unsupported download format.');
+    } catch (e) {
+      console.error(e);
+      alert('Download failed:\n' + e.message);
+    }
+  }
+
+  // ===== Right panel hide/show =====
   const rightPanel = document.getElementById('rightPanel');
   const showRightFloat = document.getElementById('showRightFloat');
   document.getElementById('hideRightBtn').addEventListener('click', () => {
@@ -592,7 +827,7 @@
     showRightFloat.style.display = 'none';
   });
 
-  // Polygon control hide/show (collapse)
+  // ===== Polygon control hide/show (collapse) =====
   function wirePolygonToggle() {
     const btn = document.getElementById('polyToggleBtn');
     const body = document.getElementById('polyBody');
@@ -618,9 +853,17 @@
         map.fitBounds(poly.getBounds(), { padding: [20,20] });
         setPolygonFromLayer(poly);
       } catch (e) {
-        alert("Could not parse polygon coordinates:\n" + e.message);
+        alert('Could not parse polygon coordinates:\n' + e.message);
       }
     });
+
+    const fileInput = document.getElementById('polyFileInput');
+    if (fileInput) {
+      fileInput.addEventListener('change', async (ev) => {
+        const f = ev.target.files && ev.target.files[0] ? ev.target.files[0] : null;
+        await handlePolygonFile(f);
+      });
+    }
   }
   wirePolygonUI();
 
@@ -641,28 +884,16 @@
 
   document.getElementById('copyBtn').addEventListener('click', async () => {
     const txt = document.getElementById('samplesBox').value || '';
-    if (!txt.trim()) return alert("No sample coordinates yet.");
+    if (!txt.trim()) return alert('No sample coordinates yet.');
     try {
       await navigator.clipboard.writeText(txt);
-      setPolyStatus("Copied coordinates.");
+      setPolyStatus('Copied coordinates.');
     } catch {
-      alert("Copy failed. You can still select + copy manually.");
+      alert('Copy failed. You can still select + copy manually.');
     }
   });
 
-  document.getElementById('csvBtn').addEventListener('click', () => {
-    if (!lastSamples) return alert("No samples yet.");
-    const pack = featuresToTextAndCSV(lastSamples);
-    const blob = new Blob([pack.csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "soil_samples.csv";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  });
+  document.getElementById('downloadBtn').addEventListener('click', downloadSamples);
 
   // Draw events
   map.on(L.Draw.Event.CREATED, function (event) {
