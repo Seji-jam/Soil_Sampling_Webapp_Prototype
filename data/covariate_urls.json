@@ -5,5 +5,5 @@
   "mrvbf": "https://storage.cloud.google.com/soilesampler-prototype/indiana/v1/dem_slope_tippecanoe/mrvbf_18157.tif",
   "NDVI": "https://storage.cloud.google.com/soilesampler-prototype/indiana/v1/ndvi_july_5yr/tiles/ndvi_july_5yr_18157.tif",
   "total_clay": "https://storage.cloud.google.com/soilesampler-prototype/indiana/v1/SSURGO/total_clay_18157.tif",
-  "twi": "https://storage.googleapis.com/<YOUR_BUCKET>/dem_slope/twi_18157.tif"
+  "twi": "https://storage.cloud.google.com/soilesampler-prototype/indiana/v1/dem_slope_tippecanoe/twi_18157.tif"
 }
