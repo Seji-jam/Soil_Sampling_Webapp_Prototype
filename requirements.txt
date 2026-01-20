@@ -6,3 +6,5 @@ shapely
 pyproj
 clhs
 scipy
+rasterio
+affine
