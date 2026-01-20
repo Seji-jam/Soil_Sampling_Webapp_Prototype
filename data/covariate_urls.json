@@ -1,6 +1,6 @@
 {
   "slope": "https://storage.cloud.google.com/soilesampler-prototype/indiana/v1/dem_slope_tippecanoe/slope_10m_18157.tif",
-  "BSI": "https://storage.googleapis.com/soilesampler-prototype/indiana/v1/bsi_july_5yr/bsi_july_5yr_18157.tif",
+  "BSI": "https://storage.cloud.google.com/soilesampler-prototype/indiana/v1/bsi_july_5yr/bsi_july_5yr_18157.tif",
   "CEC": "https://storage.cloud.google.com/soilesampler-prototype/indiana/v1/SSURGO/cec_18157.tif",
   "mrvbf": "https://storage.cloud.google.com/soilesampler-prototype/indiana/v1/dem_slope_tippecanoe/mrvbf_18157.tif",
   "NDVI": "https://storage.cloud.google.com/soilesampler-prototype/indiana/v1/ndvi_july_5yr/tiles/ndvi_july_5yr_18157.tif",
