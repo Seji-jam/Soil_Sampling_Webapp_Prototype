@@ -82,7 +82,7 @@ def suggest_clhs_samples(
     scale_mode: str = "rank_normal",
     base_seed: int = 42,
     n_iterations: Optional[int] = None,
-    n_repeats: int = 1,
+    n_repeats: int = 10,
     optimize_metric: str = "bd",
     optimize_reg_covar: float = 1e-6,
 ) -> pd.DataFrame:
