@@ -41,7 +41,7 @@ except Exception:
 # -----------------------------------------------------------------------------
 # Config: COG URLs (public https://storage.googleapis.com/... or signed URLs)
 #
-# Preferred: set env var COVARIATE_URLS_JSON to a JSON object like:
+# Preferred: set env var COVARIATE_URLS_JSON to a JSON object:
 # {
 #   "ref": "https://storage.googleapis.com/<bucket>/dem_slope/dem_3dep_10m_18157.tif",
 #   "slope": "https://storage.googleapis.com/<bucket>/dem_slope/slope_10m_18157.tif",
@@ -87,7 +87,7 @@ def _load_covariate_urls() -> Dict[str, str]:
         urls = json.loads(p.read_text())
         return {k: _normalize_gcs_url(v) for k, v in urls.items()}
 
-    # 3) optional repo file (if you create it)
+    # 3) optional repo file 
     p = ROOT_DIR / "data" / "covariate_urls.json"
     if p.exists():
         urls = json.loads(p.read_text())
@@ -111,6 +111,16 @@ def _make_valid_polygon(g):
         return make_valid(g)
     except Exception:
         return g.buffer(0)
+
+
+def _polygon_area_acres(polygon_geojson: dict) -> float:
+    """
+    Compute polygon area in acres using EPSG:5070 (matches the covariate rasters).
+    """
+    geom = polygon_geojson.get("geometry", polygon_geojson)
+    poly_ll = shape(geom)
+    poly_5070 = _make_valid_polygon(shp_transform(_TO_RASTER, poly_ll))
+    return float(poly_5070.area / ACRE_M2)
 
 
 # -----------------------------------------------------------------------------
@@ -338,6 +348,7 @@ def recommend_n(req: RecommendRequest):
                 return payload
 
         df_sub = _raster_candidates(req.polygon)
+        area_acres = _polygon_area_acres(req.polygon)
         if df_sub.empty:
             payload = {
                 "candidates_count": 0,
@@ -354,6 +365,10 @@ def recommend_n(req: RecommendRequest):
             include_xy_in_clhs=False,
             scale_mode="rank_normal",
             rep_metric=metric,
+            clhs_repeats=int(os.getenv("CLHS_REPEATS_RECOMMEND", "3")),
+            area_acres=area_acres,
+            max_area_acres=float(os.getenv("MAX_AREA_ACRES", "500")),
+            cap_large_samples=int(os.getenv("CAP_LARGE_SAMPLES", "200")),
         )
         _RECO_CACHE[key] = (now, payload)
         return payload
@@ -369,7 +384,11 @@ def suggest_samples(req: SamplingRequest):
         if df_sub.empty:
             return {"type": "FeatureCollection", "features": []}
 
-        n_samples = int(min(max(1, req.n_samples), len(df_sub)))
+        area_acres = _polygon_area_acres(req.polygon)
+        n_req = int(req.n_samples)
+        if area_acres > float(os.getenv("MAX_AREA_ACRES", "500")):
+            n_req = min(n_req, int(os.getenv("CAP_LARGE_SAMPLES", "200")))
+        n_samples = int(min(max(1, n_req), len(df_sub)))
 
         df_sel = suggest_clhs_samples(
             df_sub,
@@ -377,6 +396,9 @@ def suggest_samples(req: SamplingRequest):
             polygon_geojson=req.polygon,
             include_xy_in_clhs=False,
             scale_mode="rank_normal",
+            n_repeats=int(os.getenv("CLHS_REPEATS_SUGGEST", "10")),
+            optimize_metric=os.getenv("CLHS_OPT_METRIC", "bd"),
+            optimize_reg_covar=float(os.getenv("CLHS_OPT_REG_COVAR", "1e-6")),
         )
 
         features = []

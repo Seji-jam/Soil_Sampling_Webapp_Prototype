@@ -5,6 +5,7 @@ import hashlib
 from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
+import math
 import pandas as pd
 
 ENV_VARS = ["slope", "BSI", "CEC", "mrvbf", "NDVI", "total_clay", "twi"]
@@ -70,7 +71,7 @@ def _extract_indices_from_clhs(res, n_samples: int) -> np.ndarray:
 
 
 # -------------------------
-# Core sampler (your CLHS)
+# Core sampler
 # -------------------------
 def suggest_clhs_samples(
     df_candidates: pd.DataFrame,
@@ -81,10 +82,12 @@ def suggest_clhs_samples(
     scale_mode: str = "rank_normal",
     base_seed: int = 42,
     n_iterations: Optional[int] = None,
+    n_repeats: int = 1,
+    optimize_metric: str = "bd",
+    optimize_reg_covar: float = 1e-6,
 ) -> pd.DataFrame:
     """
     Returns subset selected by CLHS.
-    Never raises due to CLHS: falls back to stable random sample.
     """
     df = df_candidates.copy()
 
@@ -119,14 +122,52 @@ def suggest_clhs_samples(
 
     try:
         from clhs import clhs
-        res = clhs(Xs, n_samples, seed=int(seed), n_iterations=int(n_iterations), progress=False)
-        idx = _extract_indices_from_clhs(res, n_samples=n_samples)
-        idx = np.asarray(idx, dtype=int)
 
-        if idx.ndim != 1 or len(idx) != n_samples or idx.min() < 0 or idx.max() >= N:
-            raise ValueError("CLHS returned invalid indices")
+        n_repeats = int(max(1, n_repeats))
+        best_idx = None
+        best_score = None
 
-        return df.iloc[idx].copy()
+        for r in range(n_repeats):
+            # Vary the seed deterministically so the same polygon+N yields stable results,
+            # while allowing multiple "restarts" to improve the final design.
+            seed_r = int((int(seed) + 1009 * r) % (2**31 - 1))
+
+            try:
+                res = clhs(
+                    Xs,
+                    n_samples,
+                    seed=seed_r,
+                    n_iterations=int(n_iterations),
+                    progress=False,
+                )
+                idx = _extract_indices_from_clhs(res, n_samples=n_samples)
+                idx = np.asarray(idx, dtype=int)
+
+                if idx.ndim != 1 or len(idx) != n_samples or idx.min() < 0 or idx.max() >= N:
+                    continue
+
+                df_s = df.iloc[idx]
+                sc = representativeness_score(
+                    df_full=df,
+                    df_sample=df_s,
+                    covariates=covariates,
+                    scale_mode=scale_mode,
+                    metric=optimize_metric,
+                    reg_covar=float(optimize_reg_covar),
+                )
+
+                if best_score is None or sc < best_score:
+                    best_score = float(sc)
+                    best_idx = idx
+
+            except Exception:
+                continue
+
+        if best_idx is None:
+            idx = rng.choice(N, size=n_samples, replace=False)
+            return df.iloc[idx].copy()
+
+        return df.iloc[best_idx].copy()
 
     except Exception:
         idx = rng.choice(N, size=n_samples, replace=False)
@@ -312,37 +353,58 @@ def representativeness_score(
     raise ValueError("metric must be one of: bd, kld, quantile")
 
 
-def _default_n_grid(N: int) -> List[int]:
+def _default_n_grid(N: int, max_n: int, trad_n: Optional[int] = None) -> List[int]:
     """
-    A web-friendly grid that still gives a meaningful curve.
+    Build an evaluation grid of sample sizes (n) for the representativeness curve.
 
-    Notes:
-      - The older 5..60 cap often made all tiers collapse to the same N.
-      - For typical farm-field polygons, users may plausibly take 20–200 samples.
-      - We still keep the grid relatively small so /api/recommend-n is fast.
+    Design goals:
+      - Dense (step=2) in the small-to-moderate n region where decisions are sensitive.
+      - Coarser for larger n so the backend doesn't run hundreds of cLHS optimizations.
+      - Respect an externally chosen max_n (e.g., traditional grid size or a cap).
+
+    Notes
+    -----
+    This is NOT "use up to 200 samples" by itself. It is only the list of n values
+    we evaluate to build the curve. The actual recommendations come from tier
+    thresholds on that curve.
     """
-    if N <= 12:
-        return list(range(1, N + 1))
-    base = [
-        5,
-        10,
-        15,
-        20,
-        30,
-        40,
-        50,
-        60,
-        80,
-        100,
-        120,
-        150,
-        200,
-    ]
-    grid = sorted({n for n in base if n <= N})
-    if grid[-1] != min(200, N):
-        grid.append(min(200, N))
-    return grid
+    max_n = int(max(1, min(int(max_n), int(N))))
 
+    if max_n <= 12:
+        return list(range(1, max_n + 1))
+
+    grid = set()
+
+    # Fine resolution in the practically relevant region
+    hi = int(min(80, max_n))
+    for n in range(5, hi + 1, 2):
+        grid.add(int(n))
+
+    # Coarser resolution beyond 60
+    if max_n > 80:
+        hi2 = int(min(140, max_n))
+        for n in range(80, hi2 + 1, 5):
+            grid.add(int(n))
+
+        if max_n > 140:
+            for n in range(140, max_n + 1, 10):
+                grid.add(int(n))
+
+    # Anchor points (useful for reporting, and for monotone smoothing)
+    for n in (70, 80, 90, 100, 120, 150, 200):
+        if n <= max_n:
+            grid.add(int(n))
+
+    # Make sure the "traditional" target is on the curve (and its +/-2 neighborhood)
+    if trad_n is not None:
+        for n in (trad_n - 2, trad_n, trad_n + 2):
+            if 1 <= n <= max_n:
+                grid.add(int(n))
+
+    # Always include the end point we can realistically recommend/evaluate
+    grid.add(int(max_n))
+
+    return sorted(grid)
 
 def recommend_sample_sizes(
     df_candidates: pd.DataFrame,
@@ -355,6 +417,12 @@ def recommend_sample_sizes(
     reg_covar: float = 1e-6,
     n_grid: Optional[List[int]] = None,
     base_seed: int = 42,
+    clhs_repeats: int = 5,
+    # --- area-aware recommendation controls ---
+    area_acres: Optional[float] = None,
+    acres_per_sample_traditional: float = 2.5,
+    max_area_acres: float = 500.0,
+    cap_large_samples: int = 200,
 ) -> Dict[str, Any]:
     """
     Returns:
@@ -374,11 +442,40 @@ def recommend_sample_sizes(
             "tiers": {"weak": 0, "medium": 0, "good": 0, "perfect": 0},
         }
 
-    n_grid = n_grid or _default_n_grid(N)
-    n_grid = [int(n) for n in n_grid if 1 <= int(n) <= N]
-    n_grid = sorted(set(n_grid))
-    if not n_grid:
-        n_grid = [min(30, N)]
+    # -------------------------
+    # Area-aware max N selection
+    # -------------------------
+    warnings: List[str] = []
+    trad_n: Optional[int] = None
+
+    if area_acres is not None and area_acres > 0:
+        trad_n = int(math.ceil(float(area_acres) / float(acres_per_sample_traditional)))
+        if float(area_acres) > float(max_area_acres):
+            n_cap = int(min(int(cap_large_samples), int(N)))
+            warnings.append(
+                f"Large area ({area_acres:.1f} acres). Recommendations are capped at {n_cap} samples "
+                f"(app is designed for field-scale polygons ≤ {max_area_acres:.0f} acres). "
+                "Consider splitting into smaller fields or management zones."
+            )
+        else:
+            n_cap = int(min(int(trad_n), int(N)))
+    else:
+        # If area isn't provided, keep a safe web-friendly cap for the curve.
+        n_cap = int(min(200, int(N)))
+
+    n_cap = int(max(1, n_cap))
+
+    # -------------------------
+    # Evaluation grid for curve
+    # -------------------------
+    if n_grid is None:
+        n_grid = _default_n_grid(N, max_n=n_cap, trad_n=trad_n)
+    else:
+        # Respect caller-provided grid, but clip to what we can actually evaluate.
+        n_grid = [int(n) for n in n_grid if 1 <= int(n) <= int(n_cap)]
+        n_grid = sorted(set(n_grid))
+        if not n_grid:
+            n_grid = [int(n_cap)]
 
     # compute curve
     curve = []
@@ -392,6 +489,9 @@ def recommend_sample_sizes(
             include_xy_in_clhs=include_xy_in_clhs,
             scale_mode=scale_mode,
             base_seed=base_seed,
+            n_repeats=clhs_repeats,
+            optimize_metric=rep_metric,
+            optimize_reg_covar=reg_covar,
         )
         sc = representativeness_score(
             df,
@@ -436,6 +536,11 @@ def recommend_sample_sizes(
         "candidates_count": int(N),
         "curve": curve,
         "tiers": tiers,
+        # meta for UI
+        "area_acres": float(area_acres) if area_acres is not None else None,
+        "traditional_n": int(trad_n) if trad_n is not None else None,
+        "max_allowed_samples": int(n_cap),
+        "warnings": warnings,
     }
 
 
