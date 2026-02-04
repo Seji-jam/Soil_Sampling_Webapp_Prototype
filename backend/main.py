@@ -60,6 +60,9 @@ except Exception:
 ROOT_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = ROOT_DIR / "frontend"
 
+# Unit conversions
+ACRE_M2 = 4046.8564224  # m^2 per acre
+
 
 def _normalize_gcs_url(u: str) -> str:
     u = (u or "").strip()
