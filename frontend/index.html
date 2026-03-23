@@ -98,7 +98,7 @@
     }
     .poly-body textarea { min-height: 64px; }
   
-    /* ===== Loading overlay (long computations) ===== */
+    /* Loading overlay (shown during long operations) */
     .loading-overlay {
       position: fixed;
       inset: 0;
@@ -107,56 +107,57 @@
       display: flex;
       align-items: center;
       justify-content: center;
+      padding: 16px;
     }
+    .loading-overlay.hidden { display: none; }
     .loading-card {
-      width: min(420px, calc(100% - 40px));
-      background: white;
+      width: min(520px, calc(100vw - 32px));
+      background: #fff;
+      border: 1px solid #e5e7eb;
       border-radius: 14px;
-      padding: 16px 18px;
-      box-shadow: 0 4px 18px rgba(0,0,0,0.22);
-      border: 1px solid rgba(0,0,0,0.10);
-      font: 13px/1.4 Arial, sans-serif;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.12);
+      padding: 18px 18px 14px 18px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
     }
-    .loading-row { display:flex; align-items:center; gap: 12px; }
+    .loading-row {
+      display: flex;
+      gap: 14px;
+      align-items: center;
+    }
     .spinner {
-      width: 34px;
-      height: 34px;
-      border-radius: 50%;
-      border: 4px solid rgba(0,0,0,0.12);
-      border-top-color: rgba(0,0,0,0.65);
+      width: 28px;
+      height: 28px;
+      border-radius: 999px;
+      border: 3px solid rgba(0,0,0,0.12);
+      border-top-color: rgba(0,0,0,0.55);
       animation: spin 0.9s linear infinite;
       flex: 0 0 auto;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .loading-title { font-weight: 700; font-size: 14px; }
-    .loading-sub { margin-top: 4px; color: #555; font-size: 12px; }
-    .loading-actions { margin-top: 12px; display:flex; align-items:center; gap: 8px; }
-    .loading-actions button { width: auto; padding: 6px 10px; }
-    .loading-timer { margin-left: auto; color: #666; font-size: 12px; }
+    .loading-title { font-weight: 700; margin: 0; font-size: 15px; }
+    .loading-sub { margin: 4px 0 0 0; color: #444; font-size: 13px; line-height: 1.35; }
+    .loading-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 12px;
+      gap: 12px;
+    }
+    .loading-timer { font-size: 12px; color: #555; }
+    .btn-ghost {
+      border: 1px solid #ddd;
+      background: #fff;
+      border-radius: 10px;
+      padding: 6px 10px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .btn-ghost:hover { background: #f7f7f7; }
 
   </style>
 </head>
 <body>
 <div id="map"></div>
-
-
-<!-- Loading overlay (shown during long computations) -->
-<div id="loadingOverlay" class="loading-overlay hidden" role="status" aria-live="polite" aria-busy="true">
-  <div class="loading-card">
-    <div class="loading-row">
-      <div class="spinner" aria-hidden="true"></div>
-      <div style="flex:1;">
-        <div id="loadingTitle" class="loading-title">Working…</div>
-        <div id="loadingText" class="loading-sub">This can take a few minutes due to optimization.</div>
-      </div>
-    </div>
-    <div class="loading-actions">
-      <button id="cancelBtn" type="button">Cancel</button>
-      <div class="loading-timer" id="loadingTimer">0:00</div>
-    </div>
-  </div>
-</div>
-
 
 <!-- RIGHT: sampling + outputs -->
 <div class="panel" id="rightPanel">
@@ -312,64 +313,17 @@
   let lastReco = null;
   let lastSamples = null;
 
-  // ===== long-request loading overlay + cancel =====
-  let currentAbortController = null;
-  let loadingTick = null;
-  let loadingStartMs = null;
-
-  function showLoading(title, text) {
-    const ov = document.getElementById('loadingOverlay');
-    if (!ov) return;
-    document.getElementById('loadingTitle').textContent = title || 'Working…';
-    document.getElementById('loadingText').textContent = text || 'Please wait…';
-    ov.classList.remove('hidden');
-
-    // simple timer so user sees progress (elapsed time)
-    loadingStartMs = Date.now();
-    const timerEl = document.getElementById('loadingTimer');
-    if (timerEl) {
-      timerEl.textContent = '0:00';
-      if (loadingTick) clearInterval(loadingTick);
-      loadingTick = setInterval(() => {
-        const s = Math.max(0, Math.floor((Date.now() - loadingStartMs) / 1000));
-        const mm = String(Math.floor(s / 60));
-        const ss = String(s % 60).padStart(2, '0');
-        timerEl.textContent = `${mm}:${ss}`;
-      }, 500);
-    }
-  }
-
-  function hideLoading() {
-    const ov = document.getElementById('loadingOverlay');
-    if (ov) ov.classList.add('hidden');
-    if (loadingTick) { clearInterval(loadingTick); loadingTick = null; }
-    loadingStartMs = null;
-    currentAbortController = null;
-  }
-
-  // Cancel button aborts the in-flight request (if any)
-  const cancelBtn = document.getElementById('cancelBtn');
-  if (cancelBtn) {
-    cancelBtn.addEventListener('click', () => {
-      try { currentAbortController?.abort(); } catch {}
-      hideLoading();
-      setPolyStatus("Canceled.");
-      setActionButtonsEnabled(!!currentPolygon);
-    });
-  }
-
-
   const GAIN_THRESH = { weak: 0.60, medium: 0.75, good: 0.88, perfect: 0.95 };
 
   const polyStatusEl = () => document.getElementById('polyStatus');
   const setPolyStatus = (m) => { const el = polyStatusEl(); if (el) el.textContent = m; };
 
-  async function postJSON(url, payload, signal) {
+  async function postJSON(url, payload, opts = {}) {
     const r = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      signal
+      signal: opts.signal
     });
     if (!r.ok) {
       const txt = await r.text();
@@ -377,8 +331,50 @@
     }
     return await r.json();
   }
+// --- Loading overlay + cancel (AbortController) ---
+  let currentAbort = null;
+  let loadingTick = null;
+  let loadingStartMs = null;
 
-  function setDisabled(id, disabled) {
+  function showLoading(title, sub) {
+    const ov = document.getElementById('loadingOverlay');
+    if (!ov) return;
+    document.getElementById('loadingTitle').textContent = title || "Working…";
+    document.getElementById('loadingSub').textContent = sub || "This may take a bit. Please keep this tab open.";
+    document.getElementById('loadingTimer').textContent = "0:00";
+    ov.classList.remove('hidden');
+
+    loadingStartMs = Date.now();
+    if (loadingTick) clearInterval(loadingTick);
+    loadingTick = setInterval(() => {
+      const s = Math.floor((Date.now() - loadingStartMs) / 1000);
+      const mm = String(Math.floor(s / 60));
+      const ss = String(s % 60).padStart(2, '0');
+      document.getElementById('loadingTimer').textContent = `${mm}:${ss}`;
+    }, 500);
+  }
+
+  function hideLoading() {
+    const ov = document.getElementById('loadingOverlay');
+    if (ov) ov.classList.add('hidden');
+    if (loadingTick) { clearInterval(loadingTick); loadingTick = null; }
+    loadingStartMs = null;
+    currentAbort = null;
+  }
+
+  function cancelActiveRequest() {
+    if (currentAbort) {
+      try { currentAbort.abort(); } catch {}
+    }
+  }
+
+  // Hook cancel button
+  (function(){
+    const btn = document.getElementById('loadingCancelBtn');
+    if (btn) btn.addEventListener('click', cancelActiveRequest);
+  })();
+
+function setDisabled(id, disabled) {
     const el = document.getElementById(id);
     if (el) el.disabled = !!disabled;
   }
@@ -438,7 +434,7 @@
     document.getElementById('recoBox').innerHTML = `Candidates: —<br>Recommendations: —<br>`;
     document.getElementById('samplesBox').value = '';
     setActionButtonsEnabled(false);
-    setPolyStatus("No polygon. Draw one or paste coordinates.");
+    setPolyStatus("Ready");
   }
 
   function setPolygonFromLayer(layer) {
@@ -525,9 +521,9 @@
     setDisabled('sampleBtn', true);
     document.getElementById('recoBox').innerHTML = `Candidates: —<br>Recommendations: <i>Computing...</i><br>`;
     try {
-      currentAbortController = new AbortController();
-      showLoading("Analyzing polygon…", "Computing recommended sample sizes. With repeats=10 this may take a few minutes.");
-      const reco = await postJSON('/api/recommend-n', { polygon: currentPolygon, cost_per_sample: cost, metric }, currentAbortController.signal);
+      currentAbort = new AbortController();
+      showLoading('Analyzing polygon…', 'Computing recommendations (this can take a few minutes with repeats).');
+      const reco = await postJSON('/api/recommend-n', { polygon: currentPolygon, cost_per_sample: cost, metric }, { signal: currentAbort.signal });
       lastReco = reco;
       updateRecoBox(reco);
       if (reco?.tiers?.good) {
@@ -536,14 +532,19 @@
       }
       setPolyStatus("Recommendations updated.");
     } catch (err) {
-      if (err && err.name === 'AbortError') {
-        setPolyStatus("Canceled.");
+      if (err && (err.name === 'AbortError' || String(err).includes('AbortError'))) {
+        setPolyStatus('Canceled.');
+        return;
+      }
+      if (err && (err.name === 'AbortError' || String(err).includes('AbortError'))) {
+        setPolyStatus('Canceled.');
         return;
       }
       console.error(err);
       setPolyStatus("Analyze failed");
-      alert("Analyze failed:" + err.message);
+      alert("Analyze failed:\n" + err.message);
     } finally {
+      hideLoading();
       btn.textContent = prevTxt;
       // re-enable only if polygon still exists
       setActionButtonsEnabled(!!currentPolygon);
@@ -586,9 +587,9 @@
     setDisabled('sampleBtn', true);
     setDisabled('analyzeBtn', true);
     try {
-      currentAbortController = new AbortController();
-      showLoading("Selecting samples…", `Running cLHS optimization (best of repeats). N=${n}. This may take a few minutes.`);
-      const data = await postJSON('/api/suggest-samples', { polygon: currentPolygon, n_samples: n }, currentAbortController.signal);
+      currentAbort = new AbortController();
+      showLoading(`Selecting samples (N=${n})…`, 'Running cLHS optimization (repeats may take a few minutes).');
+      const data = await postJSON('/api/suggest-samples', { polygon: currentPolygon, n_samples: n }, { signal: currentAbort.signal });
       lastSamples = data;
 
       if (sampleLayer) map.removeLayer(sampleLayer);
@@ -606,13 +607,13 @@
 
       setPolyStatus(`Done: ${(data.features || []).length} points`);
     } catch (err) {
-      if (err && err.name === 'AbortError') {
-        setPolyStatus("Canceled.");
+      if (err && (err.name === 'AbortError' || String(err).includes('AbortError'))) {
+        setPolyStatus('Canceled.');
         return;
       }
       console.error(err);
       setPolyStatus("Fetch failed");
-      alert("Error fetching samples:" + err.message);
+      alert("Error fetching samples:\n" + err.message);
     } finally {
       hideLoading();
       btn.textContent = prevTxt;
@@ -721,5 +722,22 @@
     clearPolygonState();
   });
 </script>
+
+<div id="loadingOverlay" class="loading-overlay hidden" role="status" aria-live="polite" aria-busy="true">
+  <div class="loading-card">
+    <div class="loading-row">
+      <div class="spinner" aria-hidden="true"></div>
+      <div style="min-width: 0;">
+        <p class="loading-title" id="loadingTitle">Working…</p>
+        <p class="loading-sub" id="loadingSub">This may take a bit (e.g., repeats / raster sampling). Please keep this tab open.</p>
+      </div>
+    </div>
+    <div class="loading-actions">
+      <div class="loading-timer">Elapsed: <span id="loadingTimer">0:00</span></div>
+      <button class="btn-ghost" id="loadingCancelBtn" type="button">Cancel</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>
